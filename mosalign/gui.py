@@ -40,9 +40,6 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.stitched_image = None
         self.stitched_lock = QtCore.QMutex()
 
-        # Test/Mock mode
-        self.test_mode = False
-
         # Timer to refresh preview during scan
         self.preview_timer = QtCore.QTimer()
         self.preview_timer.timeout.connect(self._refresh_stitched_preview)
@@ -131,11 +128,6 @@ class MotorScanDialog(QtWidgets.QDialog):
         # Settings group
         settings_group = QtWidgets.QGroupBox("Settings")
         settings_layout = QtWidgets.QFormLayout()
-
-        # Test mode checkbox
-        self.test_mode_checkbox = QtWidgets.QCheckBox("Test Mode (Mock PVs/Tomoscan)")
-        self.test_mode_checkbox.toggled.connect(self._toggle_test_mode)
-        settings_layout.addRow("", self.test_mode_checkbox)
 
         self.pixel_size = QtWidgets.QDoubleSpinBox()
         self.pixel_size.setRange(0.001, 100)
@@ -347,15 +339,6 @@ class MotorScanDialog(QtWidgets.QDialog):
         except Exception as e:
             self._log(f"Failed to save config: {e}")
 
-    def _toggle_test_mode(self, checked: bool):
-        """Toggle test/mock mode"""
-        self.test_mode = checked
-        if checked:
-            self._log("Test Mode ENABLED - using mock PVs and tomoscan")
-            self.connection_status.setText("Test Mode: Mock camera enabled")
-        else:
-            self._log("Test Mode DISABLED - using real PVs and tomoscan")
-            self.connection_status.setText("Status: Not connected")
 
     def _on_preview_toggled(self, checked: bool):
         """Handle changes to the 'Enable Live Preview' checkbox."""
@@ -377,38 +360,6 @@ class MotorScanDialog(QtWidgets.QDialog):
             if hasattr(self, "_preview_initialized"):
                 delattr(self, "_preview_initialized")
 
-    def _generate_mock_image(self, position_index: int, total_positions: int):
-        """Generate a mock image for testing"""
-        img_h, img_w = 1024, 1280
-
-        # Create base gradient
-        y_grad = np.linspace(0, 1, img_h)[:, np.newaxis]
-        x_grad = np.linspace(0, 1, img_w)[np.newaxis, :]
-
-        # Position-dependent pattern
-        pattern = (np.sin(x_grad * 10 + position_index) * 0.3 +
-                   np.cos(y_grad * 8 + position_index * 0.5) * 0.3 +
-                   0.4)
-
-        # Add circular features
-        center_y, center_x = img_h // 2, img_w // 2
-        y_coords = np.arange(img_h)[:, np.newaxis] - center_y
-        x_coords = np.arange(img_w)[np.newaxis, :] - center_x
-        radius = np.sqrt(x_coords**2 + y_coords**2)
-        circle_pattern = np.exp(-radius / 300) * 0.3
-
-        # Combine patterns
-        img = pattern + circle_pattern
-
-        # Add noise
-        noise = np.random.normal(0, 0.05, (img_h, img_w))
-        img = img + noise
-
-        # Normalize to uint16 range
-        img = np.clip(img, 0, 1)
-        img = (img * 40000 + 5000).astype(np.uint16)
-
-        return img
 
     def _log(self, message: str):
         """Add message to log in a thread-safe way.
@@ -475,14 +426,17 @@ class MotorScanDialog(QtWidgets.QDialog):
             self.stitched_lock.unlock()
 
     def _get_image_now(self, position_index: int = 1, total_positions: int = 1):
-        if self.test_mode:
-            return self._generate_mock_image(position_index, total_positions)
+        """Get current image from parent viewer.
 
+        Returns:
+            numpy.ndarray: The current image, or None if unavailable
+        """
         try:
             parent = self.parent()
 
             if not parent:
                 self._log(f"⚠ No parent viewer available")
+                self._log(f"   This plugin must be run from PyStream viewer")
                 return None
 
             for attempt in range(3):
@@ -495,11 +449,11 @@ class MotorScanDialog(QtWidgets.QDialog):
 
                     if img_ref is None:
                         if attempt < 2:
-                            time.sleep(0.05)
+                            time.sleep(0.1)
                             continue
                         else:
                             self._log(f"⚠ No image available from main viewer after retries")
-                            self._log(f"   Please ensure the main viewer is connected and receiving images")
+                            self._log(f"   Please ensure the camera is connected and streaming")
                             return None
 
                     img = np.array(img_ref, dtype=img_ref.dtype)
@@ -514,7 +468,7 @@ class MotorScanDialog(QtWidgets.QDialog):
                 except (AttributeError, RuntimeError, ValueError) as e:
                     if attempt < 2:
                         self._log(f"⚠ Retry {attempt + 1}/3: {e}")
-                        time.sleep(0.05)
+                        time.sleep(0.1)
                         continue
                     else:
                         self._log(f"⚠ Could not copy viewer image after retries: {e}")
@@ -531,9 +485,7 @@ class MotorScanDialog(QtWidgets.QDialog):
             return None
 
     def _caput(self, pv: str, value: float, timeout: float):
-        if self.test_mode:
-            return
-
+        """Set EPICS PV value using caput"""
         try:
             subprocess.run(
                 ['caput', '-w', str(timeout), pv, str(value)],
@@ -547,10 +499,7 @@ class MotorScanDialog(QtWidgets.QDialog):
             self._log(f"⚠ caput error for {pv}: {e}")
 
     def _wait_for_motor(self, pv: str, target: float, tolerance: float = 0.001, timeout: float = 30.0):
-        if self.test_mode:
-            time.sleep(0.05)
-            return True
-
+        """Wait for motor to reach target position"""
         readback_pv = f"{pv}.RBV"
         start_time = time.time()
 
@@ -707,7 +656,7 @@ class ScanWorker(QtCore.QThread):
             self.dialog._caput(motor1_pv, x_start, timeout)
             time.sleep(0.1)
             self.dialog._caput(motor2_pv, y_start, timeout)
-            time.sleep(settle_time if not self.dialog.test_mode else 0.1)
+            time.sleep(settle_time)
 
             # Get test image to determine canvas size
             self.log_signal.emit("Getting test image...")
@@ -754,21 +703,20 @@ class ScanWorker(QtCore.QThread):
                         f"[{position}/{total_positions}] X={x_pos:.3f}, Y={y_pos:.3f}"
                     )
 
-                    if not self.dialog.test_mode:
-                        try:
-                            subprocess.run(['caput', motor1_pv, str(x_pos)],
-                                           capture_output=True, timeout=5)
-                            subprocess.run(['caput', motor2_pv, str(y_pos)],
-                                           capture_output=True, timeout=5)
-                        except Exception as e:
-                            self.log_signal.emit(f"  ⚠ Motor error: {e}")
+                    try:
+                        subprocess.run(['caput', motor1_pv, str(x_pos)],
+                                       capture_output=True, timeout=5)
+                        subprocess.run(['caput', motor2_pv, str(y_pos)],
+                                       capture_output=True, timeout=5)
+                    except Exception as e:
+                        self.log_signal.emit(f"  ⚠ Motor error: {e}")
 
                     self.dialog._wait_for_motor(motor1_pv, x_pos, motor_tolerance, timeout)
                     self.dialog._wait_for_motor(motor2_pv, y_pos, motor_tolerance, timeout)
 
                     self.position_signal.emit(position, total_positions, x_pos, y_pos, 0)
 
-                    time.sleep(0.1 if self.dialog.test_mode else settle_time)
+                    time.sleep(settle_time)
 
                     img = None
                     max_retries = 3
