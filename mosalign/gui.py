@@ -455,20 +455,37 @@ class MotorScanDialog(QtWidgets.QDialog):
             channel = pva.Channel(image_pv)
             img_data = channel.get()
 
+            # Debug: show what keys are available
+            self._log(f"PVA data keys: {list(img_data.keys())}")
+
             # Extract image array from PVA structure
+            # Try different possible field names
+            img_array = None
             if 'value' in img_data:
                 img_array = np.array(img_data['value'])
+            elif 'ubyteValue' in img_data:
+                img_array = np.array(img_data['ubyteValue'])
+            elif 'shortValue' in img_data:
+                img_array = np.array(img_data['shortValue'])
+            elif 'intValue' in img_data:
+                img_array = np.array(img_data['intValue'])
+
+            if img_array is not None:
                 # Reshape based on dimension fields
                 if 'dimension' in img_data:
                     dims = img_data['dimension']
+                    self._log(f"Dimension info: {dims}")
                     if len(dims) >= 2:
                         height = dims[0]['size']
                         width = dims[1]['size']
                         img = img_array.reshape((height, width))
                         self._log(f"✓ Got image from PVA ({width}x{height})")
                         return img
+                else:
+                    self._log(f"⚠ No dimension field in PVA data")
+            else:
+                self._log(f"⚠ No recognized image array field in PVA data")
 
-            self._log(f"⚠ Could not parse image from PVA")
             return None
 
         except ImportError:
