@@ -453,32 +453,50 @@ class MotorScanDialog(QtWidgets.QDialog):
 
             self._log(f"Connecting to PV: {image_pv}")
             channel = pva.Channel(image_pv)
-            ntnda = channel.get()
+            pv_data = channel.get()
 
-            # Extract image following PyStream's approach
-            dims = ntnda['dimension']
-            if len(dims) < 2:
-                self._log(f"⚠ Invalid dimensions: {len(dims)}")
-                return None
+            # Check structure type
+            struct_id = pv_data.getStructureDict().get('value', {}).get('id', '')
+            self._log(f"PV structure ID: {struct_id}")
 
-            # Get field key and raw data
-            try:
-                field_key = ntnda.getSelectedUnionFieldName()
-                raw = ntnda['value'][0][field_key]
-            except Exception:
-                try:
-                    field_key = next(iter(ntnda['value'][0].keys()))
-                    raw = ntnda['value'][0][field_key]
-                except (StopIteration, KeyError):
-                    self._log(f"⚠ No image data in PVA structure")
+            # Handle NTNDArray structure
+            if 'dimension' in pv_data:
+                dims = pv_data['dimension']
+                if len(dims) < 2:
+                    self._log(f"⚠ Invalid dimensions: {len(dims)}")
                     return None
 
-            # Reshape to 2D image
-            nx = dims[0]['size']
-            ny = dims[1]['size']
-            img = np.asarray(raw).reshape(ny, nx)
+                # Get field key and raw data
+                try:
+                    field_key = pv_data.getSelectedUnionFieldName()
+                    raw = pv_data['value'][0][field_key]
+                except Exception:
+                    try:
+                        field_key = next(iter(pv_data['value'][0].keys()))
+                        raw = pv_data['value'][0][field_key]
+                    except (StopIteration, KeyError):
+                        self._log(f"⚠ No image data in PVA structure")
+                        return None
 
-            self._log(f"✓ Got image from PVA ({nx}x{ny})")
+                nx = dims[0]['size']
+                ny = dims[1]['size']
+                img = np.asarray(raw).reshape(ny, nx)
+            else:
+                # Simple structure - just get the value array directly
+                self._log(f"Trying simple value extraction...")
+                raw = pv_data['value']
+                img = np.asarray(raw)
+
+                if img.ndim == 1:
+                    self._log(f"⚠ 1D array, need dimensions. Shape: {img.shape}")
+                    return None
+                elif img.ndim == 2:
+                    pass  # Already correct shape
+                elif img.ndim == 3:
+                    # Take first channel if RGB
+                    img = img[:, :, 0]
+
+            self._log(f"✓ Got image from PVA ({img.shape[1]}x{img.shape[0]})")
             return img
 
         except ImportError:
