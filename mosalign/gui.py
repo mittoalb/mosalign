@@ -511,21 +511,33 @@ class MotorScanDialog(QtWidgets.QDialog):
                 return None
 
             channel = pva.Channel(image_pv)
-            ntnda = channel.get()
+            pv_data = channel.get()
 
-            # Use PyStream's reshape function
-            uid, img, nx, ny, nz, cm, key = reshape_ntnda(ntnda)
-
-            if img is None:
-                self._log(f"⚠ No image data from PVA")
-                return None
-
-            # Convert RGB to grayscale if needed
-            if img.ndim == 3 and img.shape[2] in (3, 4):
-                img = (0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]).astype(np.float32, copy=False)
-
-            self._log(f"✓ Got image from PVA ({nx}x{ny})")
-            return img
+            # Try NTNDArray format first
+            if 'uniqueId' in pv_data and 'dimension' in pv_data:
+                uid, img, nx, ny, nz, cm, key = reshape_ntnda(pv_data)
+                if img is None:
+                    self._log(f"⚠ No image data from NTNDArray")
+                    return None
+                # Convert RGB to grayscale if needed
+                if img.ndim == 3 and img.shape[2] in (3, 4):
+                    img = (0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]).astype(np.float32, copy=False)
+                self._log(f"✓ Got image from PVA NTNDArray ({nx}x{ny})")
+                return img
+            else:
+                # Simple PVA image structure - just grab the value
+                img = np.asarray(pv_data['value'])
+                if img.ndim == 2:
+                    self._log(f"✓ Got image from PVA ({img.shape[1]}x{img.shape[0]})")
+                    return img
+                elif img.ndim == 3:
+                    # RGB - take first channel
+                    img = img[:, :, 0]
+                    self._log(f"✓ Got image from PVA ({img.shape[1]}x{img.shape[0]})")
+                    return img
+                else:
+                    self._log(f"⚠ Unexpected image dimensions: {img.shape}")
+                    return None
 
         except ImportError:
             self._log(f"⚠ pvaccess module not available - cannot get images")
