@@ -16,11 +16,71 @@ import os
 import subprocess
 import time
 import numpy as np
-from typing import Optional
+from typing import Optional, Tuple
 from PyQt5 import QtWidgets, QtCore, QtGui
 
 import pyqtgraph as pg
 pg.setConfigOptions(imageAxisOrder='row-major')
+
+
+def reshape_ntnda(ntnda) -> Tuple[int, np.ndarray, int, int, Optional[int], int, str]:
+    """Returns: (imageId, image, nx, ny, nz, colorMode, fieldKey)
+    Copied from PyStream to parse NTNDArray PVA structures.
+    """
+    image_id = ntnda['uniqueId']
+    dims = ntnda['dimension']
+    nDims = len(dims)
+
+    color_mode = 0
+    if 'attribute' in ntnda:
+        for a in ntnda['attribute']:
+            if a.get('name') == 'ColorMode':
+                try:
+                    color_mode = a['value'][0]['value']
+                except Exception:
+                    pass
+                break
+
+    try:
+        field_key = ntnda.getSelectedUnionFieldName()
+        raw = ntnda['value'][0][field_key]
+    except Exception:
+        try:
+            field_key = next(iter(ntnda['value'][0].keys()))
+            raw = ntnda['value'][0][field_key]
+        except (StopIteration, KeyError):
+            return (image_id, None, None, None, None, color_mode, '')
+
+    if nDims == 0:
+        return (image_id, None, None, None, None, color_mode, field_key)
+
+    if nDims == 2 and color_mode == 0:
+        nx = dims[0]['size']; ny = dims[1]['size']
+        img = np.asarray(raw).reshape(ny, nx)
+        return (image_id, img, nx, ny, None, color_mode, field_key)
+
+    if nDims == 3:
+        d0, d1, d2 = dims[0]['size'], dims[1]['size'], dims[2]['size']
+        arr = np.asarray(raw)
+        if color_mode == 2:
+            nz, nx, ny = d0, d1, d2
+            img = arr.reshape(nz, nx, ny).transpose(2, 1, 0)
+        elif color_mode == 3:
+            nx, nz, ny = d0, d1, d2
+            img = arr.reshape(nx, nz, ny).transpose(2, 0, 1)
+        elif color_mode == 4:
+            nx, ny, nz = d0, d1, d2
+            img = arr.reshape(nx, ny, nz).transpose(1, 0, 2)
+        else:
+            if 1 in (d0, d1, d2):
+                ny, nx = sorted([d0, d1, d2], reverse=True)[:2]
+                img = arr.reshape(ny, nx); color_mode = 0
+            else:
+                raise ValueError(f'Unsupported dims/colorMode: {dims}, cm={color_mode}')
+        return (image_id, img, img.shape[1], img.shape[0], img.shape[2] if img.ndim == 3 else None,
+                color_mode, field_key)
+
+    raise ValueError(f'Invalid NTNDArray dims: {dims}')
 
 
 class MotorScanDialog(QtWidgets.QDialog):
@@ -442,7 +502,6 @@ class MotorScanDialog(QtWidgets.QDialog):
                     return img
 
         # Fallback: try to get image via pvaPy
-        self._log("Attempting to get image via PVA...")
         try:
             import pvaccess as pva
             image_pv = self.image_pv.text().strip()
@@ -451,52 +510,21 @@ class MotorScanDialog(QtWidgets.QDialog):
                 self._log(f"⚠ No image PV configured")
                 return None
 
-            self._log(f"Connecting to PV: {image_pv}")
             channel = pva.Channel(image_pv)
-            pv_data = channel.get()
+            ntnda = channel.get()
 
-            # Check structure type
-            struct_id = pv_data.getStructureDict().get('value', {}).get('id', '')
-            self._log(f"PV structure ID: {struct_id}")
+            # Use PyStream's reshape function
+            uid, img, nx, ny, nz, cm, key = reshape_ntnda(ntnda)
 
-            # Handle NTNDArray structure
-            if 'dimension' in pv_data:
-                dims = pv_data['dimension']
-                if len(dims) < 2:
-                    self._log(f"⚠ Invalid dimensions: {len(dims)}")
-                    return None
+            if img is None:
+                self._log(f"⚠ No image data from PVA")
+                return None
 
-                # Get field key and raw data
-                try:
-                    field_key = pv_data.getSelectedUnionFieldName()
-                    raw = pv_data['value'][0][field_key]
-                except Exception:
-                    try:
-                        field_key = next(iter(pv_data['value'][0].keys()))
-                        raw = pv_data['value'][0][field_key]
-                    except (StopIteration, KeyError):
-                        self._log(f"⚠ No image data in PVA structure")
-                        return None
+            # Convert RGB to grayscale if needed
+            if img.ndim == 3 and img.shape[2] in (3, 4):
+                img = (0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]).astype(np.float32, copy=False)
 
-                nx = dims[0]['size']
-                ny = dims[1]['size']
-                img = np.asarray(raw).reshape(ny, nx)
-            else:
-                # Simple structure - just get the value array directly
-                self._log(f"Trying simple value extraction...")
-                raw = pv_data['value']
-                img = np.asarray(raw)
-
-                if img.ndim == 1:
-                    self._log(f"⚠ 1D array, need dimensions. Shape: {img.shape}")
-                    return None
-                elif img.ndim == 2:
-                    pass  # Already correct shape
-                elif img.ndim == 3:
-                    # Take first channel if RGB
-                    img = img[:, :, 0]
-
-            self._log(f"✓ Got image from PVA ({img.shape[1]}x{img.shape[0]})")
+            self._log(f"✓ Got image from PVA ({nx}x{ny})")
             return img
 
         except ImportError:
