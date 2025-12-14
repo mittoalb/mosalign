@@ -88,6 +88,7 @@ class MotorScanDialog(QtWidgets.QDialog):
 
     BUTTON_TEXT = "Mosalign"
     HANDLER_TYPE = 'singleton'  # Keep one instance, show/hide it
+    _viewer_instance = None  # Class variable to store viewer reference
 
     def __init__(self, parent=None, logger: Optional[logging.Logger] = None):
         super().__init__(parent)
@@ -95,6 +96,10 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.scanning = False
         self.scan_thread = None
         self.current_image = None
+
+        # Store viewer reference if parent has _last_display_img
+        if parent and hasattr(parent, '_last_display_img'):
+            MotorScanDialog._viewer_instance = parent
 
         # For stitched preview
         self.stitched_image = None
@@ -493,8 +498,11 @@ class MotorScanDialog(QtWidgets.QDialog):
         """
         parent = self.parent()
         if not parent:
-            self._log(f"⚠ No parent viewer - mosalign must run as PyStream plugin")
-            return None
+            # Fallback to class variable if parent not set
+            parent = MotorScanDialog._viewer_instance
+            if not parent:
+                self._log(f"⚠ No parent viewer - mosalign must run as PyStream plugin")
+                return None
 
         if not hasattr(parent, '_last_display_img'):
             self._log(f"⚠ Parent viewer does not have _last_display_img")
