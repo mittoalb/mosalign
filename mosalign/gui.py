@@ -453,40 +453,33 @@ class MotorScanDialog(QtWidgets.QDialog):
 
             self._log(f"Connecting to PV: {image_pv}")
             channel = pva.Channel(image_pv)
-            img_data = channel.get()
+            ntnda = channel.get()
 
-            # Debug: show what keys are available
-            self._log(f"PVA data keys: {list(img_data.keys())}")
+            # Extract image following PyStream's approach
+            dims = ntnda['dimension']
+            if len(dims) < 2:
+                self._log(f"⚠ Invalid dimensions: {len(dims)}")
+                return None
 
-            # Extract image array from PVA structure
-            # Try different possible field names
-            img_array = None
-            if 'value' in img_data:
-                img_array = np.array(img_data['value'])
-            elif 'ubyteValue' in img_data:
-                img_array = np.array(img_data['ubyteValue'])
-            elif 'shortValue' in img_data:
-                img_array = np.array(img_data['shortValue'])
-            elif 'intValue' in img_data:
-                img_array = np.array(img_data['intValue'])
+            # Get field key and raw data
+            try:
+                field_key = ntnda.getSelectedUnionFieldName()
+                raw = ntnda['value'][0][field_key]
+            except Exception:
+                try:
+                    field_key = next(iter(ntnda['value'][0].keys()))
+                    raw = ntnda['value'][0][field_key]
+                except (StopIteration, KeyError):
+                    self._log(f"⚠ No image data in PVA structure")
+                    return None
 
-            if img_array is not None:
-                # Reshape based on dimension fields
-                if 'dimension' in img_data:
-                    dims = img_data['dimension']
-                    self._log(f"Dimension info: {dims}")
-                    if len(dims) >= 2:
-                        height = dims[0]['size']
-                        width = dims[1]['size']
-                        img = img_array.reshape((height, width))
-                        self._log(f"✓ Got image from PVA ({width}x{height})")
-                        return img
-                else:
-                    self._log(f"⚠ No dimension field in PVA data")
-            else:
-                self._log(f"⚠ No recognized image array field in PVA data")
+            # Reshape to 2D image
+            nx = dims[0]['size']
+            ny = dims[1]['size']
+            img = np.asarray(raw).reshape(ny, nx)
 
-            return None
+            self._log(f"✓ Got image from PVA ({nx}x{ny})")
+            return img
 
         except ImportError:
             self._log(f"⚠ pvaccess module not available - cannot get images")
