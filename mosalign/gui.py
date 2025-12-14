@@ -22,6 +22,12 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 pg.setConfigOptions(imageAxisOrder='row-major')
 
+try:
+    import pvaccess as pva
+    PVA_AVAILABLE = True
+except ImportError:
+    PVA_AVAILABLE = False
+
 
 def reshape_ntnda(ntnda) -> Tuple[int, np.ndarray, int, int, Optional[int], int, str]:
     """Returns: (imageId, image, nx, ny, nz, colorMode, fieldKey)
@@ -104,6 +110,11 @@ class MotorScanDialog(QtWidgets.QDialog):
         # For stitched preview
         self.stitched_image = None
         self.stitched_lock = QtCore.QMutex()
+
+        # PVA channel for standalone mode
+        self.pva_channel = None
+        self._last_pva_image = None
+        self._pva_image_lock = QtCore.QMutex()
 
         # Timer to refresh preview during scan
         self.preview_timer = QtCore.QTimer()
@@ -240,6 +251,10 @@ class MotorScanDialog(QtWidgets.QDialog):
 
         self.connection_status = QtWidgets.QLabel("Status: Not connected")
         image_layout.addWidget(self.connection_status)
+
+        self.connect_pva_btn = QtWidgets.QPushButton("Connect to PV")
+        self.connect_pva_btn.clicked.connect(self._on_connect_pva)
+        image_layout.addWidget(self.connect_pva_btn)
 
         image_group.setLayout(image_layout)
         layout.addWidget(image_group)
@@ -490,36 +505,100 @@ class MotorScanDialog(QtWidgets.QDialog):
         finally:
             self.stitched_lock.unlock()
 
+    def _pva_callback(self, pv):
+        """PVA monitor callback - receives new images from camera"""
+        try:
+            image_id, img, nx, ny, nz, color_mode, field_key = reshape_ntnda(pv)
+
+            if img is not None:
+                self._pva_image_lock.lock()
+                self._last_pva_image = img
+                self._pva_image_lock.unlock()
+        except Exception as e:
+            self._log(f"PVA callback error: {e}")
+
+    def _start_pva_monitor(self, pv_name: str):
+        """Start PVA monitor for standalone image acquisition"""
+        if not PVA_AVAILABLE:
+            self._log("⚠ pvaccess not available - install with: pip install pvaccess")
+            return False
+
+        try:
+            if self.pva_channel is not None:
+                self._stop_pva_monitor()
+
+            self._log(f"Starting PVA monitor for {pv_name}...")
+            self.pva_channel = pva.Channel(pv_name)
+            self.pva_channel.subscribe('monitor', self._pva_callback)
+            self.pva_channel.startMonitor()
+            self._log(f"✓ PVA monitor started for {pv_name}")
+            return True
+        except Exception as e:
+            self._log(f"⚠ Failed to start PVA monitor: {e}")
+            self.pva_channel = None
+            return False
+
+    def _stop_pva_monitor(self):
+        """Stop PVA monitor"""
+        if self.pva_channel is not None:
+            try:
+                self.pva_channel.stopMonitor()
+                self.pva_channel.unsubscribe('monitor')
+                self.pva_channel = None
+                self._log("PVA monitor stopped")
+            except Exception as e:
+                self._log(f"Error stopping PVA monitor: {e}")
+
+    def _on_connect_pva(self):
+        """Handle Connect/Disconnect button click"""
+        if self.pva_channel is not None:
+            # Disconnect
+            self._stop_pva_monitor()
+            self.connection_status.setText("Status: Disconnected")
+            self.connect_pva_btn.setText("Connect to PV")
+        else:
+            # Connect
+            pv_name = self.image_pv.text().strip()
+            if not pv_name:
+                self._log("⚠ Please enter a PV name")
+                return
+
+            if self._start_pva_monitor(pv_name):
+                self.connection_status.setText(f"Status: Connected to {pv_name}")
+                self.connect_pva_btn.setText("Disconnect")
+            else:
+                self.connection_status.setText("Status: Connection failed")
+
     def _get_image_now(self, position_index: int = 1, total_positions: int = 1):
-        """Get current image from parent viewer.
+        """Get current image from parent viewer or PVA channel.
 
         Returns:
             numpy.ndarray: The current image, or None if unavailable
         """
+        # Try to get from parent viewer first (PyStream plugin mode)
         parent = self.parent()
         if not parent:
-            # Fallback to class variable if parent not set
             parent = MotorScanDialog._viewer_instance
-            if not parent:
-                self._log(f"⚠ No parent viewer - mosalign must run as PyStream plugin")
-                return None
 
-        if not hasattr(parent, '_last_display_img'):
-            self._log(f"⚠ Parent viewer does not have _last_display_img")
-            return None
+        if parent and hasattr(parent, '_last_display_img'):
+            img_ref = parent._last_display_img
+            if img_ref is not None:
+                img = np.array(img_ref, dtype=img_ref.dtype)
+                if img.size > 0:
+                    self._log(f"✓ Got image from viewer ({img.shape[1]}x{img.shape[0]})")
+                    return img
 
-        img_ref = parent._last_display_img
-        if img_ref is None:
-            self._log(f"⚠ No image available from viewer yet")
-            return None
+        # Fall back to PVA monitor (standalone mode)
+        self._pva_image_lock.lock()
+        img = self._last_pva_image
+        self._pva_image_lock.unlock()
 
-        img = np.array(img_ref, dtype=img_ref.dtype)
-        if img.size == 0:
-            self._log(f"⚠ Empty image from viewer")
-            return None
+        if img is not None:
+            self._log(f"✓ Got image from PVA ({img.shape[1]}x{img.shape[0]})")
+            return np.array(img, dtype=img.dtype)
 
-        self._log(f"✓ Got image from viewer ({img.shape[1]}x{img.shape[0]})")
-        return img
+        self._log(f"⚠ No image available from viewer or PVA")
+        return None
 
     def _caput(self, pv: str, value: float, timeout: float):
         """Set EPICS PV value using caput"""
@@ -640,6 +719,9 @@ class MotorScanDialog(QtWidgets.QDialog):
 
         # Save settings
         self._save_config()
+
+        # Stop PVA monitor
+        self._stop_pva_monitor()
 
         if self.preview_timer.isActive():
             self.preview_timer.stop()
