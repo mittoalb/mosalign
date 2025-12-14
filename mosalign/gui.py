@@ -669,6 +669,7 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.scan_thread.log_signal.connect(self._log)
         self.scan_thread.position_signal.connect(self._update_position)
         self.scan_thread.finished_signal.connect(self._scan_finished)
+        self.scan_thread.update_preview_signal.connect(self._refresh_stitched_preview)
         self.scan_thread.start()
 
         self._log("=== Scan started ===")
@@ -741,6 +742,7 @@ class ScanWorker(QtCore.QThread):
     log_signal = QtCore.pyqtSignal(str)
     position_signal = QtCore.pyqtSignal(int, int, float, float, float)
     finished_signal = QtCore.pyqtSignal()
+    update_preview_signal = QtCore.pyqtSignal()
 
     def __init__(self, dialog):
         super().__init__()
@@ -850,6 +852,7 @@ class ScanWorker(QtCore.QThread):
 
                     if img is not None:
                         self._place_image_in_canvas(img, i, j, eff_w, eff_h, out_w, out_h)
+                        self.update_preview_signal.emit()  # Trigger preview update
                         self.log_signal.emit(f"  ✓ Image captured and placed in mosaic")
                     else:
                         self.log_signal.emit(f"  ✗ No image available - check camera stream")
