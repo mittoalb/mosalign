@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mosalign"
+version = "1.0.0"
+description = "A PyQt5-based tool for 2D motor scanning with live stitched preview and tomoscan integration"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Alberto Mittone", email = "amittone@anl.gov"}
+]
+keywords = [
+    "motor-scan",
+    "alignment",
+    "mosaic",
+    "tomography",
+    "epics",
+    "beamline",
+    "aps"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: X11 Applications :: Qt",
+    "Framework :: Qt",
+]
+
+dependencies = [
+    "PyQt5>=5.15.0",
+    "numpy>=1.20.0",
+    "pyqtgraph>=0.12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=22.0",
+    "flake8>=4.0",
+]
+
+[project.scripts]
+mosalign = "mosalign:main"
+
+[tool.setuptools]
+packages = ["mosalign"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
