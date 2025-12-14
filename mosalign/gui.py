@@ -426,60 +426,57 @@ class MotorScanDialog(QtWidgets.QDialog):
             self.stitched_lock.unlock()
 
     def _get_image_now(self, position_index: int = 1, total_positions: int = 1):
-        """Get current image from parent viewer.
+        """Get current image from parent viewer or PVA.
 
         Returns:
             numpy.ndarray: The current image, or None if unavailable
         """
-        try:
-            parent = self.parent()
-
-            if not parent:
-                self._log(f"⚠ No parent viewer available")
-                self._log(f"   This plugin must be run from PyStream viewer")
-                return None
-
-            for attempt in range(3):
-                try:
-                    if not hasattr(parent, '_last_display_img'):
-                        self._log(f"⚠ Parent viewer does not have _last_display_img attribute")
-                        return None
-
-                    img_ref = parent._last_display_img
-
-                    if img_ref is None:
-                        if attempt < 2:
-                            time.sleep(0.1)
-                            continue
-                        else:
-                            self._log(f"⚠ No image available from main viewer after retries")
-                            self._log(f"   Please ensure the camera is connected and streaming")
-                            return None
-
-                    img = np.array(img_ref, dtype=img_ref.dtype)
-
-                    if img.size == 0:
-                        self._log(f"⚠ Empty image from main viewer")
-                        return None
-
-                    self._log(f"✓ Got image from main viewer ({img.shape[1]}x{img.shape[0]})")
+        # Try parent viewer first (when running as PyStream plugin)
+        parent = self.parent()
+        if parent and hasattr(parent, '_last_display_img'):
+            img_ref = parent._last_display_img
+            if img_ref is not None:
+                img = np.array(img_ref, dtype=img_ref.dtype)
+                if img.size > 0:
+                    self._log(f"✓ Got image from parent viewer ({img.shape[1]}x{img.shape[0]})")
                     return img
 
-                except (AttributeError, RuntimeError, ValueError) as e:
-                    if attempt < 2:
-                        self._log(f"⚠ Retry {attempt + 1}/3: {e}")
-                        time.sleep(0.1)
-                        continue
-                    else:
-                        self._log(f"⚠ Could not copy viewer image after retries: {e}")
-                        return None
+        # Fallback: try to get image via pvaPy
+        self._log("Attempting to get image via PVA...")
+        try:
+            import pvaccess as pva
+            image_pv = self.image_pv.text().strip()
 
+            if not image_pv:
+                self._log(f"⚠ No image PV configured")
+                return None
+
+            self._log(f"Connecting to PV: {image_pv}")
+            channel = pva.Channel(image_pv)
+            img_data = channel.get()
+
+            # Extract image array from PVA structure
+            if 'value' in img_data:
+                img_array = np.array(img_data['value'])
+                # Reshape based on dimension fields
+                if 'dimension' in img_data:
+                    dims = img_data['dimension']
+                    if len(dims) >= 2:
+                        height = dims[0]['size']
+                        width = dims[1]['size']
+                        img = img_array.reshape((height, width))
+                        self._log(f"✓ Got image from PVA ({width}x{height})")
+                        return img
+
+            self._log(f"⚠ Could not parse image from PVA")
             return None
 
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            self._log(f"⚠ Unexpected error getting image: {e}")
+        except ImportError:
+            self._log(f"⚠ pvaccess module not available - cannot get images")
+            self._log(f"   Install with: pip install pvaccess")
+            return None
+        except Exception as pva_err:
+            self._log(f"⚠ PVA error: {pva_err}")
             import traceback
             self._log(traceback.format_exc())
             return None
