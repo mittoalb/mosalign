@@ -486,56 +486,32 @@ class MotorScanDialog(QtWidgets.QDialog):
             self.stitched_lock.unlock()
 
     def _get_image_now(self, position_index: int = 1, total_positions: int = 1):
-        """Get current image from parent viewer or PVA.
+        """Get current image from parent viewer.
 
         Returns:
             numpy.ndarray: The current image, or None if unavailable
         """
-        # Try parent viewer first (when running as PyStream plugin)
         parent = self.parent()
-        if parent and hasattr(parent, '_last_display_img'):
-            img_ref = parent._last_display_img
-            if img_ref is not None:
-                img = np.array(img_ref, dtype=img_ref.dtype)
-                if img.size > 0:
-                    self._log(f"✓ Got image from parent viewer ({img.shape[1]}x{img.shape[0]})")
-                    return img
-
-        # Fallback: try to get image via pvaPy
-        try:
-            import pvaccess as pva
-            image_pv = self.image_pv.text().strip()
-
-            if not image_pv:
-                self._log(f"⚠ No image PV configured")
-                return None
-
-            channel = pva.Channel(image_pv)
-            pv_data = channel.get()
-
-            # Use PyStream's reshape_ntnda - it handles the structure properly
-            uid, img, nx, ny, nz, cm, key = reshape_ntnda(pv_data)
-
-            if img is None:
-                self._log(f"⚠ No image data from PVA")
-                return None
-
-            # Convert RGB to grayscale if needed
-            if img.ndim == 3 and img.shape[2] in (3, 4):
-                img = (0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]).astype(np.float32, copy=False)
-
-            self._log(f"✓ Got image from PVA ({nx}x{ny})")
-            return img
-
-        except ImportError:
-            self._log(f"⚠ pvaccess module not available - cannot get images")
-            self._log(f"   Install with: pip install pvaccess")
+        if not parent:
+            self._log(f"⚠ No parent viewer - mosalign must run as PyStream plugin")
             return None
-        except Exception as pva_err:
-            self._log(f"⚠ PVA error: {pva_err}")
-            import traceback
-            self._log(traceback.format_exc())
+
+        if not hasattr(parent, '_last_display_img'):
+            self._log(f"⚠ Parent viewer does not have _last_display_img")
             return None
+
+        img_ref = parent._last_display_img
+        if img_ref is None:
+            self._log(f"⚠ No image available from viewer yet")
+            return None
+
+        img = np.array(img_ref, dtype=img_ref.dtype)
+        if img.size == 0:
+            self._log(f"⚠ Empty image from viewer")
+            return None
+
+        self._log(f"✓ Got image from viewer ({img.shape[1]}x{img.shape[0]})")
+        return img
 
     def _caput(self, pv: str, value: float, timeout: float):
         """Set EPICS PV value using caput"""
