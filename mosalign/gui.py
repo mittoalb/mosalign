@@ -22,6 +22,15 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 pg.setConfigOptions(imageAxisOrder='row-major')
 
+# Import works both when run as a package (`mosalign.gui`) and when the
+# pystream launcher invokes this file as a script (no parent package).
+try:
+    from .tiles import TileManager, TileRunWorker, TileSidePanel
+except ImportError:
+    import os, sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tiles import TileManager, TileRunWorker, TileSidePanel
+
 
 class MotorScanDialog(QtWidgets.QDialog):
     """Dialog for configuring and running 2D motor scans"""
@@ -39,6 +48,12 @@ class MotorScanDialog(QtWidgets.QDialog):
         # For stitched preview
         self.stitched_image = None
         self.stitched_lock = QtCore.QMutex()
+
+        # Interactive tiles (created after view_box exists in _build_ui)
+        self.tile_manager: Optional[TileManager] = None
+        self.tile_run_worker: Optional[TileRunWorker] = None
+        # Last grid-scan geometry, stashed by ScanWorker for seed_from_grid
+        self._last_scan_geom: Optional[dict] = None
 
         # Test/Mock mode
         self.test_mode = False
@@ -58,36 +73,130 @@ class MotorScanDialog(QtWidgets.QDialog):
     def _build_ui(self):
         main_layout = QtWidgets.QHBoxLayout(self)
 
-        # Left panel - Controls
+        # ── Left panel ─────────────────────────────────────────────────
+        # QTabWidget at top (Scan = operational, PVs = IOC config)
+        # + always-visible action area at bottom (Start/Stop/Progress).
         left_panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(left_panel)
 
-        # Motor PVs group
-        pv_group = QtWidgets.QGroupBox("Motor PVs")
-        pv_layout = QtWidgets.QFormLayout()
+        self.left_tabs = QtWidgets.QTabWidget()
+        self.left_tabs.addTab(self._build_scan_tab(), "Scan")
+        self.left_tabs.addTab(self._build_pv_tab(),   "PVs")
+        layout.addWidget(self.left_tabs, 1)
 
-        self.motor1_pv = QtWidgets.QLineEdit("2bmb:m17")
-        self.motor2_pv = QtWidgets.QLineEdit("2bmHXP:m3")
-        self.tomoscan_path = QtWidgets.QLineEdit("tomoscan")
+        # Action buttons (kept outside the tabs so they're always visible)
+        button_layout = QtWidgets.QHBoxLayout()
 
-        pv_layout.addRow("Motor 1 (X):", self.motor1_pv)
-        pv_layout.addRow("Motor 2 (Y):", self.motor2_pv)
-        pv_layout.addRow("Tomoscan Path:", self.tomoscan_path)
+        self.start_btn = QtWidgets.QPushButton("Start Scan")
+        self.start_btn.setAutoDefault(False)
+        self.start_btn.setDefault(False)
+        self.start_btn.clicked.connect(self._start_scan)
+        button_layout.addWidget(self.start_btn)
 
-        pv_group.setLayout(pv_layout)
-        layout.addWidget(pv_group)
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn.setAutoDefault(False)
+        self.stop_btn.setDefault(False)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_scan)
+        button_layout.addWidget(self.stop_btn)
+
+        layout.addLayout(button_layout)
+
+        self.progress = QtWidgets.QProgressBar()
+        layout.addWidget(self.progress)
+
+        self.position_label = QtWidgets.QLabel("Position: -")
+        layout.addWidget(self.position_label)
+
+        main_layout.addWidget(left_panel, 1)
+
+        # Right panel - Image preview & log
+        right_panel = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+
+        # Image view
+        right_layout.addWidget(QtWidgets.QLabel("Live Preview (Stitched Mosaic)"))
+
+        self.graphics_view = pg.GraphicsLayoutWidget()
+        self.graphics_view.setMinimumSize(400, 400)  # Ensure preview is visible
+        self.view_box = self.graphics_view.addViewBox()
+        self.view_box.setAspectLocked(True)
+        self.image_view = pg.ImageItem()
+        self.view_box.addItem(self.image_view)
+
+        # Tile toolbar — sits above the preview. Buttons stay disabled until
+        # a grid scan completes (and _scan_finished seeds the tile manager).
+        tile_btns = QtWidgets.QHBoxLayout()
+        self.add_tile_btn = QtWidgets.QPushButton("+ Tile at Center")
+        self.add_tile_btn.setAutoDefault(False)
+        self.add_tile_btn.setDefault(False)
+        self.add_tile_btn.setEnabled(False)
+        self.add_tile_btn.clicked.connect(self._add_tile_at_center)
+        tile_btns.addWidget(self.add_tile_btn)
+
+        self.run_tiles_btn = QtWidgets.QPushButton("Run Tiles")
+        self.run_tiles_btn.setAutoDefault(False)
+        self.run_tiles_btn.setDefault(False)
+        self.run_tiles_btn.setEnabled(False)
+        self.run_tiles_btn.clicked.connect(self._run_tiles)
+        tile_btns.addWidget(self.run_tiles_btn)
+        tile_btns.addStretch()
+        right_layout.addLayout(tile_btns)
+
+        # Tile manager owns ROIs on view_box; created here so it's ready for
+        # config-load-time restore_rois() calls.
+        self.tile_manager = TileManager(self.view_box, self)
+
+        # Canvas + side panel in a resizable horizontal splitter.
+        # Side panel shows the currently-selected tile's motor X/Y +
+        # NumAngles / ExposureTime overrides; double-click a tile to edit.
+        self.tile_side_panel = TileSidePanel(self.tile_manager, parent=self)
+        canvas_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        canvas_splitter.addWidget(self.graphics_view)
+        canvas_splitter.addWidget(self.tile_side_panel)
+        canvas_splitter.setStretchFactor(0, 1)
+        canvas_splitter.setStretchFactor(1, 0)
+        # Side panel needs room for PV-name labels like "32idcSOFT:m17:";
+        # 320 px keeps both columns of the form layout visible.
+        canvas_splitter.setSizes([760, 320])
+        right_layout.addWidget(canvas_splitter, 2)
+
+        # Log output with terminal styling
+        right_layout.addWidget(QtWidgets.QLabel("Scan Log / Console"))
+
+        self.log_output = QtWidgets.QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setMaximumHeight(200)
+        # Terminal-style console like xanes_gui
+        self.log_output.setStyleSheet("""
+            QTextEdit {
+                background-color: #000000;
+                color: #00ff00;
+                font-family: 'Courier New', 'Monospace', monospace;
+                font-size: 10pt;
+                padding: 5px;
+            }
+        """)
+        right_layout.addWidget(self.log_output, 1)
+
+        main_layout.addWidget(right_panel, 2)
+
+    # ── Tab builders ────────────────────────────────────────────────────
+
+    def _build_scan_tab(self) -> QtWidgets.QWidget:
+        """Operational scan controls — grid parameters, timing, preview."""
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
 
         # Scan parameters group
         params_group = QtWidgets.QGroupBox("Scan Parameters")
         params_layout = QtWidgets.QGridLayout()
 
-        # Headers
-        params_layout.addWidget(QtWidgets.QLabel("<b>Axis</b>"), 0, 0)
+        params_layout.addWidget(QtWidgets.QLabel("<b>Axis</b>"),  0, 0)
         params_layout.addWidget(QtWidgets.QLabel("<b>Start</b>"), 0, 1)
-        params_layout.addWidget(QtWidgets.QLabel("<b>Step</b>"), 0, 2)
+        params_layout.addWidget(QtWidgets.QLabel("<b>Step</b>"),  0, 2)
         params_layout.addWidget(QtWidgets.QLabel("<b>Steps</b>"), 0, 3)
 
-        # X-axis
         params_layout.addWidget(QtWidgets.QLabel("X:"), 1, 0)
         self.x_start = QtWidgets.QDoubleSpinBox()
         self.x_start.setRange(-1000, 1000)
@@ -106,7 +215,6 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.x_step_size.setValue(2)
         params_layout.addWidget(self.x_step_size, 1, 3)
 
-        # Y-axis
         params_layout.addWidget(QtWidgets.QLabel("Y:"), 2, 0)
         self.y_start = QtWidgets.QDoubleSpinBox()
         self.y_start.setRange(-1000, 1000)
@@ -128,11 +236,10 @@ class MotorScanDialog(QtWidgets.QDialog):
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
 
-        # Settings group
+        # Operational settings (scan timing + test mode + tomoscan mode)
         settings_group = QtWidgets.QGroupBox("Settings")
         settings_layout = QtWidgets.QFormLayout()
 
-        # Test mode checkbox
         self.test_mode_checkbox = QtWidgets.QCheckBox("Test Mode (Mock PVs/Tomoscan)")
         self.test_mode_checkbox.toggled.connect(self._toggle_test_mode)
         settings_layout.addRow("", self.test_mode_checkbox)
@@ -164,33 +271,23 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.caput_timeout.setSuffix(" s")
         settings_layout.addRow("Caput Timeout:", self.caput_timeout)
 
+        self.tile_timeout = QtWidgets.QDoubleSpinBox()
+        self.tile_timeout.setRange(1, 86400)
+        self.tile_timeout.setDecimals(0)
+        self.tile_timeout.setValue(3600.0)
+        self.tile_timeout.setSuffix(" s")
+        settings_layout.addRow("Tile Tomoscan Timeout:", self.tile_timeout)
+
         self.run_tomoscan = QtWidgets.QCheckBox("Run tomoscan at each position")
         settings_layout.addRow("", self.run_tomoscan)
-
-        self.tomoscan_prefix = QtWidgets.QLineEdit("2bmb:TomoScan:")
-        settings_layout.addRow("Tomoscan Prefix:", self.tomoscan_prefix)
 
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
 
-        # Image PV settings
-        image_group = QtWidgets.QGroupBox("Camera PV")
-        image_layout = QtWidgets.QVBoxLayout()
-
-        self.image_pv = QtWidgets.QLineEdit("2bmbSP1:Pva1:Image")
-        image_layout.addWidget(QtWidgets.QLabel("Image PV:"))
-        image_layout.addWidget(self.image_pv)
-
-        self.connection_status = QtWidgets.QLabel("Status: Not connected")
-        image_layout.addWidget(self.connection_status)
-
-        image_group.setLayout(image_layout)
-        layout.addWidget(image_group)
-
-        # Preview settings
+        # Preview options
         self.enable_preview = QtWidgets.QCheckBox("Enable Live Preview")
         self.enable_preview.setChecked(True)
-        self.enable_preview.toggled.connect(self._on_preview_toggled)  # NEW
+        self.enable_preview.toggled.connect(self._on_preview_toggled)
         layout.addWidget(self.enable_preview)
 
         self.auto_contrast = QtWidgets.QCheckBox("Auto Contrast")
@@ -198,69 +295,60 @@ class MotorScanDialog(QtWidgets.QDialog):
         layout.addWidget(self.auto_contrast)
 
         layout.addStretch()
+        return w
 
-        # Action buttons
-        button_layout = QtWidgets.QHBoxLayout()
+    def _build_pv_tab(self) -> QtWidgets.QWidget:
+        """All PV-name / IOC-prefix configuration in one place.
 
-        self.start_btn = QtWidgets.QPushButton("Start Scan")
-        self.start_btn.setAutoDefault(False)  # Prevent Enter from triggering
-        self.start_btn.setDefault(False)
-        self.start_btn.clicked.connect(self._start_scan)
-        button_layout.addWidget(self.start_btn)
+        These rarely change once the beamline is set up — putting them on
+        a second tab keeps the main Scan tab uncluttered. Labels in the
+        side panel mirror motor1_pv / motor2_pv live (see
+        `TileSidePanel._refresh_pv_labels`).
+        """
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
 
-        self.stop_btn = QtWidgets.QPushButton("Stop")
-        self.stop_btn.setAutoDefault(False)  # Prevent Enter from triggering
-        self.stop_btn.setDefault(False)
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._stop_scan)
-        button_layout.addWidget(self.stop_btn)
+        # Motor PVs group
+        pv_group = QtWidgets.QGroupBox("Motor PVs")
+        pv_layout = QtWidgets.QFormLayout()
 
-        layout.addLayout(button_layout)
+        self.motor1_pv = QtWidgets.QLineEdit("2bmb:m17")
+        self.motor2_pv = QtWidgets.QLineEdit("2bmHXP:m3")
+        self.tomoscan_path = QtWidgets.QLineEdit("tomoscan")
 
-        # Progress
-        self.progress = QtWidgets.QProgressBar()
-        layout.addWidget(self.progress)
+        pv_layout.addRow("Motor 1 (X):",   self.motor1_pv)
+        pv_layout.addRow("Motor 2 (Y):",   self.motor2_pv)
+        pv_layout.addRow("Tomoscan Path:", self.tomoscan_path)
 
-        self.position_label = QtWidgets.QLabel("Position: -")
-        layout.addWidget(self.position_label)
+        pv_group.setLayout(pv_layout)
+        layout.addWidget(pv_group)
 
-        main_layout.addWidget(left_panel, 1)
+        # IOC / Camera prefixes + image PV
+        ioc_group = QtWidgets.QGroupBox("IOC / Camera")
+        ioc_layout = QtWidgets.QFormLayout()
 
-        # Right panel - Image preview & log
-        right_panel = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right_panel)
+        self.image_pv = QtWidgets.QLineEdit("2bmbSP1:Pva1:Image")
+        ioc_layout.addRow("Image PV:", self.image_pv)
 
-        # Image view
-        right_layout.addWidget(QtWidgets.QLabel("Live Preview (Stitched Mosaic)"))
+        self.connection_status = QtWidgets.QLabel("Status: Not connected")
+        ioc_layout.addRow("", self.connection_status)
 
-        self.graphics_view = pg.GraphicsLayoutWidget()
-        self.graphics_view.setMinimumSize(400, 400)  # Ensure preview is visible
-        self.view_box = self.graphics_view.addViewBox()
-        self.view_box.setAspectLocked(True)
-        self.image_view = pg.ImageItem()
-        self.view_box.addItem(self.image_view)
+        self.tomoscan_prefix = QtWidgets.QLineEdit("2bmb:TomoScan:")
+        ioc_layout.addRow("Tomoscan Prefix:", self.tomoscan_prefix)
 
-        right_layout.addWidget(self.graphics_view, 2)
+        # camera_prefix → reads MaxSizeX_RBV/MaxSizeY_RBV to size new tiles
+        self.camera_prefix = QtWidgets.QLineEdit("32idbSP1:cam1")
+        ioc_layout.addRow("Camera Prefix:", self.camera_prefix)
 
-        # Log output with terminal styling
-        right_layout.addWidget(QtWidgets.QLabel("Scan Log / Console"))
+        # crop_prefix → owns CropLeft/Right/Top/Bottom + Crop
+        self.crop_prefix = QtWidgets.QLineEdit("32id:TXMOptics")
+        ioc_layout.addRow("Crop Prefix:", self.crop_prefix)
 
-        self.log_output = QtWidgets.QTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setMaximumHeight(200)
-        # Terminal-style console like xanes_gui
-        self.log_output.setStyleSheet("""
-            QTextEdit {
-                background-color: #000000;
-                color: #00ff00;
-                font-family: 'Courier New', 'Monospace', monospace;
-                font-size: 10pt;
-                padding: 5px;
-            }
-        """)
-        right_layout.addWidget(self.log_output, 1)
+        ioc_group.setLayout(ioc_layout)
+        layout.addWidget(ioc_group)
 
-        main_layout.addWidget(right_panel, 2)
+        layout.addStretch()
+        return w
 
     def _load_config(self):
         """Load settings from config file"""
@@ -309,6 +397,30 @@ class MotorScanDialog(QtWidgets.QDialog):
                 if 'caput_timeout' in config:
                     self.caput_timeout.setValue(config['caput_timeout'])
 
+                # Tile-runner extras
+                if 'camera_prefix' in config:
+                    self.camera_prefix.setText(config['camera_prefix'])
+                if 'crop_prefix' in config:
+                    self.crop_prefix.setText(config['crop_prefix'])
+                if 'tile_timeout' in config:
+                    self.tile_timeout.setValue(float(config['tile_timeout']))
+
+                # Restore tiles (data + ROIs). Needs view_box already built,
+                # which is true since _build_ui ran before _load_config.
+                tile_state = config.get('tiles')
+                if tile_state and self.tile_manager is not None:
+                    try:
+                        self.tile_manager.deserialize(tile_state)
+                        self.tile_manager.restore_rois()
+                        if self.tile_manager.tiles:
+                            self.add_tile_btn.setEnabled(True)
+                            self.run_tiles_btn.setEnabled(True)
+                            self._log(
+                                f"✓ Restored {len(self.tile_manager.tiles)} "
+                                f"tile(s) from config")
+                    except Exception as e:
+                        self._log(f"⚠ Could not restore tiles: {e}")
+
                 self._log("✓ Loaded settings from config")
             except Exception as e:
                 self._log(f"Could not load config: {e}")
@@ -337,6 +449,11 @@ class MotorScanDialog(QtWidgets.QDialog):
             'y_step_size': self.y_step_size.value(),
             'settle_time': self.settle_time.value(),
             'caput_timeout': self.caput_timeout.value(),
+            'camera_prefix': self.camera_prefix.text(),
+            'crop_prefix': self.crop_prefix.text(),
+            'tile_timeout': self.tile_timeout.value(),
+            'tiles': (self.tile_manager.serialize()
+                      if self.tile_manager is not None else None),
         }
 
         try:
@@ -546,6 +663,27 @@ class MotorScanDialog(QtWidgets.QDialog):
         except subprocess.CalledProcessError as e:
             self._log(f"⚠ caput error for {pv}: {e}")
 
+    def _caget(self, pv: str, timeout: float = 2.0) -> Optional[str]:
+        """Return PV value as a stripped string, or None on failure.
+
+        No-op in test mode (returns None). Used by both `_wait_for_motor`
+        and the tile runner's crop/override snapshots.
+        """
+        if self.test_mode:
+            return None
+        try:
+            result = subprocess.run(
+                ['caget', '-t', pv],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (subprocess.TimeoutExpired, ValueError) as e:
+            self._log(f"  Warning: caget error for {pv}: {e}")
+        return None
+
     def _wait_for_motor(self, pv: str, target: float, tolerance: float = 0.001, timeout: float = 30.0):
         if self.test_mode:
             time.sleep(0.05)
@@ -555,24 +693,13 @@ class MotorScanDialog(QtWidgets.QDialog):
         start_time = time.time()
 
         while (time.time() - start_time) < timeout:
-            try:
-                result = subprocess.run(
-                    ['caget', '-t', readback_pv],
-                    capture_output=True,
-                    text=True,
-                    timeout=2.0
-                )
-
-                if result.returncode == 0:
-                    current_pos = float(result.stdout.strip())
-                    error = abs(current_pos - target)
-
-                    if error <= tolerance:
+            raw = self._caget(readback_pv, timeout=2.0)
+            if raw is not None:
+                try:
+                    if abs(float(raw) - target) <= tolerance:
                         return True
-
-            except (subprocess.TimeoutExpired, ValueError) as e:
-                self._log(f"  Warning: Error reading {readback_pv}: {e}")
-
+                except ValueError:
+                    self._log(f"  Warning: non-numeric readback {readback_pv}={raw!r}")
             time.sleep(0.1)
 
         self._log(f"⚠ Motor {pv} timeout")
@@ -613,6 +740,68 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.scanning = False
         self._log("⚠ Stopping scan...")
         self.stop_btn.setEnabled(False)
+        # If a tile run is in flight, kill the active caput so its per-tile
+        # and outer try/finally restoration blocks can run.
+        if self.tile_run_worker is not None and self.tile_run_worker.isRunning():
+            self.tile_run_worker.terminate_active()
+
+    # ── interactive-tiles slots ─────────────────────────────────────────
+
+    def _add_tile_at_center(self):
+        if self.tile_manager is None:
+            return
+        self.tile_manager.add_tile_at_view_center()
+
+    def _run_tiles(self):
+        """Launch TileRunWorker to step through each tile + StartScan."""
+        if self.tile_manager is None or not self.tile_manager.tiles:
+            self._log("⚠ No tiles to run — finish a grid scan first.")
+            return
+        if self.tile_run_worker is not None and self.tile_run_worker.isRunning():
+            self._log("⚠ Tile run already in progress.")
+            return
+
+        self.scanning = True
+        self.start_btn.setEnabled(False)
+        self.add_tile_btn.setEnabled(False)
+        self.run_tiles_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress.setValue(0)
+
+        self.tile_run_worker = TileRunWorker(self)
+        self.tile_run_worker.progress_signal.connect(self._update_progress)
+        self.tile_run_worker.log_signal.connect(self._log)
+        self.tile_run_worker.finished_signal.connect(self._tile_run_finished)
+        self.tile_run_worker.start()
+
+    def _tile_run_finished(self):
+        self.scanning = False
+        self.start_btn.setEnabled(True)
+        self.add_tile_btn.setEnabled(True)
+        self.run_tiles_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+    def _get_sensor_size(self, fallback_w: int, fallback_h: int):
+        """Return (sensor_w, sensor_h) in raw camera pixels.
+
+        Real mode reads `{camera_prefix}:MaxSizeX_RBV` / `MaxSizeY_RBV`;
+        falls back to the captured-frame dims if those PVs are unreachable.
+        Test mode skips caget and uses the captured-frame dims directly.
+        """
+        cam = self.camera_prefix.text().strip()
+        if self.test_mode or not cam:
+            return fallback_w, fallback_h
+        sw_raw = self._caget(f"{cam}:MaxSizeX_RBV")
+        sh_raw = self._caget(f"{cam}:MaxSizeY_RBV")
+        try:
+            sw = int(float(sw_raw)) if sw_raw is not None else fallback_w
+        except ValueError:
+            sw = fallback_w
+        try:
+            sh = int(float(sh_raw)) if sh_raw is not None else fallback_h
+        except ValueError:
+            sh = fallback_h
+        return sw, sh
 
     def _scan_finished(self):
         """Called when scan completes"""
@@ -636,6 +825,30 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._log("=== Scan finished ===")
+
+        # Seed the interactive-tiles overlay from the just-finished grid.
+        # If the worker bailed before stashing geometry (e.g. tomoscan-mosaic
+        # path, or test-image failure), skip silently.
+        geom = self._last_scan_geom
+        if geom and self.tile_manager is not None:
+            sensor_w, sensor_h = self._get_sensor_size(
+                geom["img_w"], geom["img_h"])
+            try:
+                self.tile_manager.seed_from_grid(
+                    x_start=geom["x_start"],
+                    y_start=geom["y_start"],
+                    x_step=geom["x_step"],
+                    y_step=geom["y_step"],
+                    nx=geom["nx"], ny=geom["ny"],
+                    pixel_size_um=geom["pixel_size_um"],
+                    img_w=geom["img_w"], img_h=geom["img_h"],
+                    out_h=geom["out_h"],
+                    sensor_w=sensor_w, sensor_h=sensor_h,
+                )
+                self.add_tile_btn.setEnabled(True)
+                self.run_tiles_btn.setEnabled(True)
+            except Exception as e:
+                self._log(f"⚠ Could not seed tiles: {e}")
 
     def _update_progress(self, current: int, total: int):
         """Update progress bar"""
@@ -663,6 +876,12 @@ class MotorScanDialog(QtWidgets.QDialog):
             self.scan_thread.wait(1000)
             if self.scan_thread.isRunning():
                 self.scan_thread.terminate()
+
+        if self.tile_run_worker and self.tile_run_worker.isRunning():
+            self.tile_run_worker.terminate_active()
+            self.tile_run_worker.wait(2000)
+            if self.tile_run_worker.isRunning():
+                self.tile_run_worker.terminate()
 
         event.accept()
 
@@ -736,6 +955,17 @@ class ScanWorker(QtCore.QThread):
             self.dialog.stitched_lock.lock()
             self.dialog.stitched_image = np.zeros((out_h, out_w), dtype=np.uint16)
             self.dialog.stitched_lock.unlock()
+
+            # Stash geometry so _scan_finished can seed the tile manager.
+            # img_w/img_h are the per-frame size; out_h is the full canvas.
+            self.dialog._last_scan_geom = dict(
+                x_start=x_start, y_start=y_start,
+                x_step=x_step, y_step=y_step,
+                nx=x_step_size, ny=y_step_size,
+                pixel_size_um=pixel_size_um,
+                img_w=img_w, img_h=img_h,
+                out_h=out_h,
+            )
 
             for i in range(x_step_size):
                 if not self.dialog.scanning:
