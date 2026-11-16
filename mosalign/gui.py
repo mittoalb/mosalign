@@ -77,49 +77,47 @@ class MotorScanDialog(QtWidgets.QDialog):
     def _build_ui(self):
         main_layout = QtWidgets.QHBoxLayout(self)
 
-        # ── Left panel ─────────────────────────────────────────────────
-        # QTabWidget at top (Scan = operational, PVs = IOC config)
-        # + always-visible action area at bottom (Start/Stop/Progress).
-        left_panel = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(left_panel)
+        # ── Left panel: settings tabs only (retractable) ───────────────
+        # Scan = operational, PVs = IOC config. Start/Stop/progress live in
+        # the toolbar above the image so they stay visible when this panel
+        # is hidden.
+        self.left_panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(self.left_panel)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         self.left_tabs = QtWidgets.QTabWidget()
         self.left_tabs.addTab(self._build_scan_tab(), "Scan")
         self.left_tabs.addTab(self._build_pv_tab(),   "PVs")
         layout.addWidget(self.left_tabs, 1)
 
-        # Action buttons (kept outside the tabs so they're always visible)
-        button_layout = QtWidgets.QHBoxLayout()
+        main_layout.addWidget(self.left_panel, 1)
+
+        # Right panel - Image preview & log
+        right_panel = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+
+        # ── Toolbar: panel toggles + all actions ───────────────────────
+        tile_btns = QtWidgets.QHBoxLayout()
+
+        self.toggle_left_btn = QtWidgets.QToolButton()
+        self.toggle_left_btn.setCheckable(True)
+        self.toggle_left_btn.setChecked(True)
+        self.toggle_left_btn.setToolTip("Show/hide the settings panel")
+        self.toggle_left_btn.toggled.connect(self._toggle_left_panel)
+        tile_btns.addWidget(self.toggle_left_btn)
 
         self.start_btn = QtWidgets.QPushButton("Start Scan")
         self.start_btn.setAutoDefault(False)
         self.start_btn.setDefault(False)
         self.start_btn.clicked.connect(self._start_scan)
-        button_layout.addWidget(self.start_btn)
+        tile_btns.addWidget(self.start_btn)
 
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.stop_btn.setAutoDefault(False)
         self.stop_btn.setDefault(False)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_scan)
-        button_layout.addWidget(self.stop_btn)
-
-        layout.addLayout(button_layout)
-
-        self.progress = QtWidgets.QProgressBar()
-        layout.addWidget(self.progress)
-
-        self.position_label = QtWidgets.QLabel("Position: -")
-        layout.addWidget(self.position_label)
-
-        main_layout.addWidget(left_panel, 1)
-
-        # Right panel - Image preview & log
-        right_panel = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right_panel)
-
-        # Image view
-        right_layout.addWidget(QtWidgets.QLabel("Live Preview (Stitched Mosaic)"))
+        tile_btns.addWidget(self.stop_btn)
 
         self.graphics_view = pg.GraphicsLayoutWidget()
         self.graphics_view.setMinimumSize(400, 400)  # Ensure preview is visible
@@ -128,9 +126,8 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.image_view = pg.ImageItem()
         self.view_box.addItem(self.image_view)
 
-        # Tile toolbar — sits above the preview. Buttons stay disabled until
-        # a grid scan completes (and _scan_finished seeds the tile manager).
-        tile_btns = QtWidgets.QHBoxLayout()
+        # Tile buttons stay disabled until a grid scan completes (and
+        # _scan_finished seeds the tile manager).
         self.add_tile_btn = QtWidgets.QPushButton("+ Tile at Center")
         self.add_tile_btn.setAutoDefault(False)
         self.add_tile_btn.setDefault(False)
@@ -144,7 +141,20 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.run_tiles_btn.setEnabled(False)
         self.run_tiles_btn.clicked.connect(self._run_tiles)
         tile_btns.addWidget(self.run_tiles_btn)
+
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setMaximumWidth(220)
+        tile_btns.addWidget(self.progress)
+        self.position_label = QtWidgets.QLabel("Position: -")
+        tile_btns.addWidget(self.position_label)
         tile_btns.addStretch()
+
+        self.toggle_right_btn = QtWidgets.QToolButton()
+        self.toggle_right_btn.setCheckable(True)
+        self.toggle_right_btn.setChecked(True)
+        self.toggle_right_btn.setToolTip("Show/hide the tile panel")
+        self.toggle_right_btn.toggled.connect(self._toggle_tile_panel)
+        tile_btns.addWidget(self.toggle_right_btn)
         right_layout.addLayout(tile_btns)
 
         # Tile manager owns ROIs on view_box; created here so it's ready for
@@ -184,6 +194,16 @@ class MotorScanDialog(QtWidgets.QDialog):
         right_layout.addWidget(self.log_output, 1)
 
         main_layout.addWidget(right_panel, 2)
+        self._toggle_left_panel(True)
+        self._toggle_tile_panel(True)
+
+    def _toggle_left_panel(self, shown: bool):
+        self.left_panel.setVisible(shown)
+        self.toggle_left_btn.setText("◀ Settings" if shown else "Settings ▶")
+
+    def _toggle_tile_panel(self, shown: bool):
+        self.tile_side_panel.setVisible(shown)
+        self.toggle_right_btn.setText("Tiles ▶" if shown else "◀ Tiles")
 
     # ── Tab builders ────────────────────────────────────────────────────
 
