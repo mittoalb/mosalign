@@ -58,6 +58,10 @@ class MotorScanDialog(QtWidgets.QDialog):
         # Test/Mock mode
         self.test_mode = False
 
+        # Frame capture state (see _get_image_now)
+        self._pva_channels: dict = {}
+        self._last_capture_error = ""
+
         # Timer to refresh preview during scan
         self.preview_timer = QtCore.QTimer()
         self.preview_timer.timeout.connect(self._refresh_stitched_preview)
@@ -312,8 +316,13 @@ class MotorScanDialog(QtWidgets.QDialog):
         pv_group = QtWidgets.QGroupBox("Motor PVs")
         pv_layout = QtWidgets.QFormLayout()
 
-        self.motor1_pv = QtWidgets.QLineEdit("2bmb:m17")
-        self.motor2_pv = QtWidgets.QLineEdit("2bmHXP:m3")
+        # No motor default: the right X/Y stages depend on the setup, and a
+        # wrong default would move the wrong hardware. _start_scan refuses
+        # to run until both are set.
+        self.motor1_pv = QtWidgets.QLineEdit("")
+        self.motor1_pv.setPlaceholderText("horizontal motor PV")
+        self.motor2_pv = QtWidgets.QLineEdit("")
+        self.motor2_pv.setPlaceholderText("vertical motor PV")
         self.tomoscan_path = QtWidgets.QLineEdit("tomoscan")
 
         pv_layout.addRow("Motor 1 (X):",   self.motor1_pv)
@@ -327,13 +336,13 @@ class MotorScanDialog(QtWidgets.QDialog):
         ioc_group = QtWidgets.QGroupBox("IOC / Camera")
         ioc_layout = QtWidgets.QFormLayout()
 
-        self.image_pv = QtWidgets.QLineEdit("2bmbSP1:Pva1:Image")
+        self.image_pv = QtWidgets.QLineEdit("32idbSP1:Pva1:Image")
         ioc_layout.addRow("Image PV:", self.image_pv)
 
         self.connection_status = QtWidgets.QLabel("Status: Not connected")
         ioc_layout.addRow("", self.connection_status)
 
-        self.tomoscan_prefix = QtWidgets.QLineEdit("2bmb:TomoScan:")
+        self.tomoscan_prefix = QtWidgets.QLineEdit("32id:TomoScan:")
         ioc_layout.addRow("Tomoscan Prefix:", self.tomoscan_prefix)
 
         # camera_prefix → reads MaxSizeX_RBV/MaxSizeY_RBV to size new tiles
@@ -591,9 +600,77 @@ class MotorScanDialog(QtWidgets.QDialog):
         finally:
             self.stitched_lock.unlock()
 
-    def _get_image_now(self, position_index: int = 1, total_positions: int = 1):
+    # ── frame capture ───────────────────────────────────────────────────
+    #
+    # Frames come from the Image PV (pvAccess NTNDArray) so mosalign works
+    # as its own window: the pystream button launches it as a separate
+    # process, where there is no parent viewer to borrow frames from.
+    # The parent-viewer path is kept only for when Image PV is left empty.
+
+    _NTNDA_VALUE_KEYS = ('ushortValue', 'shortValue', 'intValue', 'uintValue',
+                         'floatValue', 'doubleValue', 'ubyteValue', 'byteValue')
+
+    def _pva_channel(self):
+        pv = self.image_pv.text().strip()
+        if not pv:
+            return None
+        ch = self._pva_channels.get(pv)
+        if ch is None:
+            import pvaccess as pva
+            ch = pva.Channel(pv)
+            self._pva_channels[pv] = ch
+        return ch
+
+    def _frame_uid(self) -> Optional[int]:
+        """uniqueId of the newest frame on the Image PV, None if unreadable."""
+        if self.test_mode:
+            return None
+        try:
+            ch = self._pva_channel()
+            return None if ch is None else int(ch.get('field(uniqueId)')['uniqueId'])
+        except Exception:
+            return None
+
+    @classmethod
+    def _ntnda_to_array(cls, st) -> np.ndarray:
+        val = st['value'][0]
+        flat = next((np.asarray(val[k]) for k in cls._NTNDA_VALUE_KEYS if k in val), None)
+        if flat is None:
+            raise RuntimeError("unsupported NTNDArray data type")
+        dims = st['dimension']
+        # areaDetector order: dimension[0] is the width, dimension[1] the height.
+        nx, ny = int(dims[0]['size']), int(dims[1]['size'])
+        return flat.reshape(ny, nx)
+
+    def _get_image_from_pv(self, after_uid: Optional[int], timeout: float = 10.0):
+        """Newest frame on the Image PV. With `after_uid`, wait for a frame
+        newer than that one, so a frame captured after a motor move really
+        shows the new position."""
+        pv = self.image_pv.text().strip()
+        deadline = time.monotonic() + timeout
+        uid = None
+        while True:
+            uid = self._frame_uid()
+            if uid is not None and (after_uid is None or uid != after_uid):
+                try:
+                    return self._ntnda_to_array(self._pva_channel().get(''))
+                except Exception as e:
+                    self._last_capture_error = f"could not decode frame from {pv}: {e}"
+                    return None
+            if time.monotonic() >= deadline:
+                self._last_capture_error = (
+                    f"no frame on {pv}" if uid is None else
+                    f"no new frame on {pv} within {timeout:.0f}s — is the camera acquiring?")
+                return None
+            time.sleep(0.2)
+
+    def _get_image_now(self, position_index: int = 1, total_positions: int = 1,
+                       after_uid: Optional[int] = None):
+        self._last_capture_error = ""
         if self.test_mode:
             return self._generate_mock_image(position_index, total_positions)
+        if self.image_pv.text().strip():
+            return self._get_image_from_pv(after_uid)
 
         try:
             parent = self.parent()
@@ -705,8 +782,18 @@ class MotorScanDialog(QtWidgets.QDialog):
         self._log(f"⚠ Motor {pv} timeout")
         return False
 
+    def _motors_configured(self) -> bool:
+        if self.test_mode:
+            return True
+        if self.motor1_pv.text().strip() and self.motor2_pv.text().strip():
+            return True
+        self._log("⚠ Set both X and Y motor PVs first.")
+        return False
+
     def _start_scan(self):
         """Start the 2D motor scan"""
+        if not self._motors_configured():
+            return
         self.scanning = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -759,6 +846,8 @@ class MotorScanDialog(QtWidgets.QDialog):
             return
         if self.tile_run_worker is not None and self.tile_run_worker.isRunning():
             self._log("⚠ Tile run already in progress.")
+            return
+        if not self._motors_configured():
             return
 
         self.scanning = True
@@ -949,7 +1038,8 @@ class ScanWorker(QtCore.QThread):
                     f"Canvas: {out_w}×{out_h}, Image: {img_w}×{img_h}, Step: {eff_w}×{eff_h}px"
                 )
             else:
-                self.log_signal.emit("⚠ Failed to get test image!")
+                err = self.dialog._last_capture_error
+                self.log_signal.emit("⚠ Failed to get test image!" + (f" ({err})" if err else ""))
                 return
 
             self.dialog.stitched_lock.lock()
@@ -984,6 +1074,10 @@ class ScanWorker(QtCore.QThread):
                         f"[{position}/{total_positions}] X={x_pos:.3f}, Y={y_pos:.3f}"
                     )
 
+                    # Remember the newest frame before moving, so the capture
+                    # below waits for a frame taken at the new position.
+                    uid_before = self.dialog._frame_uid()
+
                     if not self.dialog.test_mode:
                         try:
                             subprocess.run(['caput', motor1_pv, str(x_pos)],
@@ -993,18 +1087,25 @@ class ScanWorker(QtCore.QThread):
                         except Exception as e:
                             self.log_signal.emit(f"  ⚠ Motor error: {e}")
 
-                    self.dialog._wait_for_motor(motor1_pv, x_pos, motor_tolerance, timeout)
-                    self.dialog._wait_for_motor(motor2_pv, y_pos, motor_tolerance, timeout)
+                    at_x = self.dialog._wait_for_motor(motor1_pv, x_pos, motor_tolerance, timeout)
+                    at_y = self.dialog._wait_for_motor(motor2_pv, y_pos, motor_tolerance, timeout)
 
                     self.position_signal.emit(position, total_positions, x_pos, y_pos, 0)
+
+                    if not (at_x and at_y):
+                        self.log_signal.emit("  ✗ motors did not reach target — frame not captured")
+                        self.progress_signal.emit(position, total_positions)
+                        continue
 
                     time.sleep(0.1 if self.dialog.test_mode else settle_time)
 
                     img = None
-                    max_retries = 3
+                    # The PV path already waits up to 10 s for a fresh frame.
+                    max_retries = 1 if self.dialog.image_pv.text().strip() else 3
 
                     for retry in range(max_retries):
-                        img = self.dialog._get_image_now(position, total_positions)
+                        img = self.dialog._get_image_now(position, total_positions,
+                                                         after_uid=uid_before)
                         if img is not None:
                             break
                         if retry < max_retries - 1:
@@ -1015,7 +1116,8 @@ class ScanWorker(QtCore.QThread):
                         self._place_image_in_canvas(img, i, j, eff_w, eff_h, out_w, out_h)
                         self.log_signal.emit(f"  ✓ Image captured and placed in mosaic")
                     else:
-                        self.log_signal.emit(f"  ✗ No image available - check camera stream")
+                        err = self.dialog._last_capture_error
+                        self.log_signal.emit("  ✗ No image available - " + (err or "check camera stream"))
 
                     self.progress_signal.emit(position, total_positions)
 

@@ -205,6 +205,7 @@ class TileManager(QtCore.QObject):
 
         self.tiles: List[Tile] = []
         self._rois: Dict[int, pg.RectROI] = {}
+        self._labels: Dict[int, pg.TextItem] = {}
         self._next_id: int = 1
         self._selected_tid: int = -1
 
@@ -249,6 +250,23 @@ class TileManager(QtCore.QObject):
                 + (self.out_h - self.img_h - cy)
                 * self.pixel_size_um / 1000.0)
         return x_mm, y_mm
+
+    # A tile smaller than the sensor is a CENTRED crop of the full frame
+    # (see TileRunWorker._apply_crop), so the motor position is the one
+    # that puts the full frame's centre on the tile's centre. Using the
+    # tile's top-left instead would image a region shifted by half the
+    # cropped-away margin.
+
+    def tile_roi_pos(self, tile: "Tile"):
+        """On-screen top-left of `tile`'s ROI."""
+        fx, fy = self.mm_to_canvas_px(tile.x_mm, tile.y_mm)
+        return (fx + (self.img_w - tile.width_px) / 2.0,
+                fy + (self.img_h - tile.height_px) / 2.0)
+
+    def roi_to_mm(self, rx: float, ry: float, w: float, h: float):
+        """Motor position for an ROI with top-left (rx, ry) and size w×h."""
+        return self.canvas_px_to_mm(rx + (w - self.img_w) / 2.0,
+                                    ry + (h - self.img_h) / 2.0)
 
     # ── seeding + lifecycle ─────────────────────────────────────────────
 
@@ -300,7 +318,7 @@ class TileManager(QtCore.QObject):
         vr = self.view_box.viewRect()
         cx = vr.center().x() - self.sensor_w / 2.0
         cy = vr.center().y() - self.sensor_h / 2.0
-        x_mm, y_mm = self.canvas_px_to_mm(cx, cy)
+        x_mm, y_mm = self.roi_to_mm(cx, cy, self.sensor_w, self.sensor_h)
         t = Tile(
             id=self._next_id,
             x_mm=x_mm, y_mm=y_mm,
@@ -352,7 +370,7 @@ class TileManager(QtCore.QObject):
         return None
 
     def _make_roi(self, tile: Tile):
-        cx, cy = self.mm_to_canvas_px(tile.x_mm, tile.y_mm)
+        cx, cy = self.tile_roi_pos(tile)
         pen_color, pen_w = self._PEN_NORMAL
         pen = pg.mkPen(pen_color, width=pen_w)
         hover_pen = pg.mkPen((255, 255, 100), width=3)
@@ -371,11 +389,13 @@ class TileManager(QtCore.QObject):
         roi.addScaleHandle([0,   0.5], [1,   0.5])
         roi.addScaleHandle([1,   0.5], [0,   0.5])
 
-        # Tile-id label (small text item at top-left of ROI, parented to ROI)
-        label = pg.TextItem(text=f"#{tile.id}", color=(255, 255, 0),
-                            anchor=(0, 1))
+        # Label at the ROI's top-left: tile id + motor position, kept in
+        # sync while the tile is dragged (see _update_label).
+        label = pg.TextItem(text="", color=(255, 255, 0), anchor=(0, 1))
         label.setParentItem(roi)
         label.setPos(0, 0)
+        self._labels[tile.id] = label
+        self._update_label(tile)
 
         # Right-click menu — override to insert our actions
         self._install_menu(roi, tile.id)
@@ -394,7 +414,13 @@ class TileManager(QtCore.QObject):
         self.view_box.addItem(roi)
         self._rois[tile.id] = roi
 
+    def _update_label(self, tile: Tile):
+        label = self._labels.get(tile.id)
+        if label is not None:
+            label.setText(f"#{tile.id}  X={tile.x_mm:.3f}  Y={tile.y_mm:.3f}")
+
     def _remove_roi(self, tid: int):
+        self._labels.pop(tid, None)
         roi = self._rois.pop(tid, None)
         if roi is not None:
             try:
@@ -431,9 +457,11 @@ class TileManager(QtCore.QObject):
             return
         pos = roi.pos()
         size = roi.size()
-        tile.x_mm, tile.y_mm = self.canvas_px_to_mm(pos.x(), pos.y())
+        tile.x_mm, tile.y_mm = self.roi_to_mm(pos.x(), pos.y(),
+                                              size.x(), size.y())
         tile.width_px = int(round(size.x()))
         tile.height_px = int(round(size.y()))
+        self._update_label(tile)
         self.tileChanged.emit(tid)
 
     def _on_roi_finished(self, tid: int):
@@ -446,7 +474,10 @@ class TileManager(QtCore.QObject):
         size = roi.size()
         new_w = max(self.MIN_SIZE_PX, min(self.sensor_w, int(round(size.x()))))
         new_h = max(self.MIN_SIZE_PX, min(self.sensor_h, int(round(size.y()))))
-        new_x_mm, new_y_mm = self.canvas_px_to_mm(pos.x(), pos.y())
+        # Position from the ROI's actual centre; a clamp then shrinks the
+        # tile around that same centre, so the motors don't move.
+        new_x_mm, new_y_mm = self.roi_to_mm(pos.x(), pos.y(),
+                                            size.x(), size.y())
 
         clamped = (new_w != int(round(size.x()))
                    or new_h != int(round(size.y())))
@@ -459,6 +490,7 @@ class TileManager(QtCore.QObject):
         if clamped:
             # Reflect the clamp back to the ROI so the user sees it
             self._sync_roi_from_tile(tile)
+        self._update_label(tile)
 
         self._log(f"[tiles] tile #{tid} → X={new_x_mm:.3f} Y={new_y_mm:.3f}  "
                   f"size {new_w}×{new_h}")
@@ -521,13 +553,14 @@ class TileManager(QtCore.QObject):
         roi = self._rois.get(tile.id)
         if roi is None:
             return
-        cx, cy = self.mm_to_canvas_px(tile.x_mm, tile.y_mm)
+        cx, cy = self.tile_roi_pos(tile)
         roi.blockSignals(True)
         try:
             roi.setPos([cx, cy], update=False)
             roi.setSize([tile.width_px, tile.height_px], update=True)
         finally:
             roi.blockSignals(False)
+        self._update_label(tile)
 
     # ── (de)serialization for config save/load ──────────────────────────
 
@@ -875,13 +908,23 @@ class TileRunWorker(QtCore.QThread):
         super().__init__()
         self.dialog = dialog
         self._active_proc: Optional[subprocess.Popen] = None
+        self._tomo_prefix: str = ""
 
     # ── public helpers ──────────────────────────────────────────────────
 
     def terminate_active(self):
-        """Called by the dialog's Stop button. Kill the in-flight caput so
-        the worker's per-tile `finally` block can run restoration."""
+        """Called by the dialog's Stop button (and on close). Abort the
+        running TomoScan scan — killing the local `caput -w StartScan`
+        alone would leave the scan running on the IOC — then kill that
+        caput so the per-tile `finally` block can run restoration."""
         if self._active_proc and self._active_proc.poll() is None:
+            if self._tomo_prefix and not self.dialog.test_mode:
+                try:
+                    subprocess.run(['caput', f"{self._tomo_prefix}AbortScan", '1'],
+                                   capture_output=True, timeout=5)
+                    self.log_signal.emit(f"  abort sent to {self._tomo_prefix}AbortScan")
+                except Exception as ex:
+                    self.log_signal.emit(f"  ⚠ AbortScan failed: {ex}")
             try:
                 self._active_proc.terminate()
             except Exception:
@@ -928,6 +971,7 @@ class TileRunWorker(QtCore.QThread):
 
             crop_prefix   = self.dialog.crop_prefix.text().strip()
             tomo_prefix   = self.dialog.tomoscan_prefix.text().strip()
+            self._tomo_prefix = tomo_prefix
             motor1_pv     = self.dialog.motor1_pv.text().strip()
             motor2_pv     = self.dialog.motor2_pv.text().strip()
             tile_timeout  = self.dialog.tile_timeout.value()
@@ -981,10 +1025,18 @@ class TileRunWorker(QtCore.QThread):
                                            caput_timeout)
                         self.dialog._caput(motor2_pv, tile.y_mm,
                                            caput_timeout)
-                        self.dialog._wait_for_motor(
+                        at_x = self.dialog._wait_for_motor(
                             motor1_pv, tile.x_mm, motor_tol, caput_timeout)
-                        self.dialog._wait_for_motor(
+                        at_y = self.dialog._wait_for_motor(
                             motor2_pv, tile.y_mm, motor_tol, caput_timeout)
+                        if not (at_x and at_y):
+                            # Scanning from the wrong place wastes a whole
+                            # tomography; skip this tile instead.
+                            self.log_signal.emit(
+                                f"  ✗ skipping tile #{tile.id}: motors did not "
+                                f"reach X={tile.x_mm:.3f} Y={tile.y_mm:.3f}")
+                            self.progress_signal.emit(idx, len(tiles))
+                            continue
                         time.sleep(0.1 if self.dialog.test_mode else settle)
 
                         for k, v in tile.overrides.items():
