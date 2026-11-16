@@ -308,6 +308,7 @@ class TileManager(QtCore.QObject):
         for tid in list(self._rois.keys()):
             self._remove_roi(tid)
         self.tiles = []
+        self._next_id = 1     # a new grid numbers its tiles from 1 again
 
     def add_tile_at_view_center(self):
         if not self.is_active():
