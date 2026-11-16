@@ -138,3 +138,29 @@ If a future refactor removes the `flipud`, fix
 ## License
 
 MIT License — Copyright (c) 2025 Alberto Mittone
+
+## Testing without hardware: fake PVs
+
+`mosalign-fake-ioc` serves every PV mosalign uses under the prefix `mosfake:`.
+It prints each write, so you can watch what mosalign does.
+
+```bash
+pip install caproto          # or: pip install .[fake]
+mosalign-fake-ioc            # terminal 1: shows every move, scan start and abort
+mosalign                     # terminal 2
+```
+
+| mosalign field | test (fake) | production |
+|---|---|---|
+| Motor 1 PV | `mosfake:m1` | horizontal sample motor |
+| Motor 2 PV | `mosfake:m2` | vertical sample motor |
+| Image PV | `mosfake:Pva1:Image` | `32idbSP1:Pva1:Image` |
+| TomoScan prefix | `mosfake:TomoScan:` | `32id:TomoScan:` |
+| Camera prefix | `mosfake:cam1` | `32idbSP1:cam1` |
+| Crop prefix | `mosfake:TXMOptics` | `32id:TXMOptics` |
+
+The motors ramp at 1 mm/s. The image is a synthetic grid with blobs, seen at
+the current motor position, so a grid scan builds a real mosaic. A
+StartScan lasts NumAngles × ExposureTime / 50 s and can be aborted. See
+`mosalign-fake-ioc -h` for frame size, pixel size and speed options.
+Leave "Test Mode" off: it bypasses EPICS completely.

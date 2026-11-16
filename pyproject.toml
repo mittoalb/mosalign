@@ -45,6 +45,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+fake = ["caproto"]   # mosalign-fake-ioc: fake PVs for testing without hardware
 dev = [
     "pytest>=7.0",
     "black>=22.0",
@@ -53,6 +54,7 @@ dev = [
 
 [project.scripts]
 mosalign = "mosalign:main"
+mosalign-fake-ioc = "mosalign.fake_ioc:main"
 
 [tool.setuptools]
 packages = ["mosalign"]

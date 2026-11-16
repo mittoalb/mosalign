@@ -914,7 +914,7 @@ class TileRunWorker(QtCore.QThread):
 
     def terminate_active(self):
         """Called by the dialog's Stop button (and on close). Abort the
-        running TomoScan scan — killing the local `caput -w StartScan`
+        running TomoScan scan — killing the local `caput -c StartScan`
         alone would leave the scan running on the IOC — then kill that
         caput so the per-tile `finally` block can run restoration."""
         if self._active_proc and self._active_proc.poll() is None:
@@ -1054,8 +1054,13 @@ class TileRunWorker(QtCore.QThread):
                             self.log_signal.emit(
                                 "  [test] StartScan skipped")
                         else:
+                            # -c = put-callback: caput returns only when the
+                            # TomoScan busy record goes back to Done, i.e.
+                            # the scan has finished. (-w alone is just the CA
+                            # timeout; without -c the next tile would move the
+                            # motors while this scan is still running.)
                             self._active_proc = subprocess.Popen(
-                                ['caput', '-w', str(tile_timeout),
+                                ['caput', '-c', '-w', str(tile_timeout),
                                  start_pv, '1'],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
