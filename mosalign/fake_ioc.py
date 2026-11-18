@@ -122,6 +122,8 @@ class FakeBeamline(PVGroup):
     # Camera (single-image acquisition) and XANES energy range PVs.
     acquire_time = logged("cam1:AcquireTime", 0.1, precision=3)
     image_mode = logged("cam1:ImageMode", 0)
+    num_images = logged("cam1:NumImages", 1)
+    shutter = logged("shutter", 0)            # fast shutter stand-in
     acquire = pvproperty(name="cam1:Acquire", value=0)
     xanes_start = logged("TXMOptics:XanesStart", 10.2, precision=4)
     xanes_end = logged("TXMOptics:XanesEnd", 10.3, precision=4)
