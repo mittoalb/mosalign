@@ -84,6 +84,33 @@ class FakeBeamline(PVGroup):
     flat_mode = pvproperty(name="TomoScan:FlatFieldMode", value="Start",
                            dtype=ChannelType.STRING)
 
+    # Remaining PVs the `tomoscan` CLI (bin/tomoscan init_PVs) connects
+    # to, so the real CLI can be run against this IOC.
+    _s = dict(dtype=ChannelType.STRING)
+    scan_type = logged("TomoScan:ScanType", "Single", **_s)
+    flat_axis = pvproperty(name="TomoScan:FlatFieldAxis", value="Both", **_s)
+    file_plugin = pvproperty(name="TomoScan:FilePluginPVPrefix", value="", **_s)
+    sample_name = pvproperty(name="TomoScan:SampleName", value="sample", **_s)
+    file_template = pvproperty(name="HDF1:FileTemplate", value="%s%s_%3.3d.h5", **_s)
+    file_number = pvproperty(name="HDF1:FileNumber", value=1)
+    dark_mode = pvproperty(name="TomoScan:DarkFieldMode", value="Start", **_s)
+    dark_value = pvproperty(name="TomoScan:DarkFieldValue", value=0.0)
+    flat_value = pvproperty(name="TomoScan:FlatFieldValue", value=0.0)
+    diff_flat_exp = pvproperty(name="TomoScan:DifferentFlatExposure", value=0)
+    flat_exp = pvproperty(name="TomoScan:FlatExposureTime", value=0.1)
+    flip_stitch = pvproperty(name="TomoScan:FlipStitch", value=0)
+    n_dark = pvproperty(name="TomoScan:NumDarkFields", value=10)
+    n_flat = pvproperty(name="TomoScan:NumFlatFields", value=10)
+    return_rot = pvproperty(name="TomoScan:ReturnRotation", value=1)
+    out_angle = pvproperty(name="TomoScan:SampleOutAngle", value=0.0)
+    out_angle_en = pvproperty(name="TomoScan:SampleOutAngleEnable", value=0)
+    out_x = pvproperty(name="TomoScan:SampleOutX", value=3.0)
+    out_y = pvproperty(name="TomoScan:SampleOutY", value=0.0)
+
+    @file_plugin.startup
+    async def file_plugin(self, instance, async_lib):
+        await instance.write(self.prefix + "HDF1:")
+
     @sample_x_pvname.startup
     async def sample_x_pvname(self, instance, async_lib):
         await instance.write(self.prefix + "m1")
@@ -114,7 +141,7 @@ class FakeBeamline(PVGroup):
     rot_step = logged("TomoScan:RotationStep", 0.12)
     rot_stop = logged("TomoScan:RotationStop", 180.0)
     file_name = logged("TomoScan:FileName", "test", dtype=ChannelType.STRING)
-    scan_status = pvproperty(name="TomoScan:ScanStatus", value="Idle",
+    scan_status = pvproperty(name="TomoScan:ScanStatus", value="Scan complete",
                              dtype=ChannelType.STRING)
     server_running = pvproperty(name="TomoScan:ServerRunning", value=1)
 
