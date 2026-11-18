@@ -34,7 +34,7 @@ import numpy as np
 from caproto import ChannelType
 from caproto.server import PVGroup, pvproperty, run
 
-STATE = {"m1": 0.0, "m2": 0.0}          # live motor readbacks, mm
+STATE = {"m1": 0.0, "m2": 0.0, "m3": 0.0}   # live motor readbacks (mm, m3 deg)
 
 
 def _log(msg: str):
@@ -60,6 +60,9 @@ def motor(name):
         _log(f"move {instance.pvname} → {target:.4f} mm "
              f"(from {STATE[name]:.4f})")
         group.start_move(name, instance, float(target))
+        # Like a real motor record: put-completion (caput -c / wait=True)
+        # fires only when the move has finished.
+        await group._moves[name]
         return target
     return prop
 
@@ -67,6 +70,43 @@ def motor(name):
 class FakeBeamline(PVGroup):
     m1 = motor("m1")
     m2 = motor("m2")
+    m3 = motor("m3")      # rotation
+
+    # TomoScan's sample motors are m1/m2 (names written at startup). After
+    # flat fields TomoScan moves the sample to SampleInX/Y — emulated in
+    # start_scan, so a scanner that forgets to set them is caught.
+    sample_x_pvname = pvproperty(name="TomoScan:SampleXPVName", value="",
+                                 dtype=ChannelType.STRING)
+    sample_y_pvname = pvproperty(name="TomoScan:SampleYPVName", value="",
+                                 dtype=ChannelType.STRING)
+    sample_in_x = logged("TomoScan:SampleInX", 0.0, precision=4)
+    sample_in_y = logged("TomoScan:SampleInY", 0.0, precision=4)
+    flat_mode = pvproperty(name="TomoScan:FlatFieldMode", value="Start",
+                           dtype=ChannelType.STRING)
+
+    @sample_x_pvname.startup
+    async def sample_x_pvname(self, instance, async_lib):
+        await instance.write(self.prefix + "m1")
+
+    @sample_y_pvname.startup
+    async def sample_y_pvname(self, instance, async_lib):
+        await instance.write(self.prefix + "m2")
+
+    # Camera (single-image acquisition) and XANES energy range PVs.
+    acquire_time = logged("cam1:AcquireTime", 0.1, precision=3)
+    image_mode = logged("cam1:ImageMode", 0)
+    acquire = pvproperty(name="cam1:Acquire", value=0)
+    xanes_start = logged("TXMOptics:XanesStart", 10.2, precision=4)
+    xanes_end = logged("TXMOptics:XanesEnd", 10.3, precision=4)
+    xanes_step = logged("TXMOptics:XanesStep", 10.0)
+
+    @acquire.putter
+    async def acquire(self, instance, value):
+        if value:
+            _log(f"ACQUIRE image at X={STATE['m1']:.4f} Y={STATE['m2']:.4f} "
+                 f"rot={STATE['m3']:.2f}  ({self.acquire_time.value} s)")
+            await asyncio.sleep(float(self.acquire_time.value))
+        return 0
 
     exposure = logged("TomoScan:ExposureTime", 0.1, precision=3)
     num_angles = logged("TomoScan:NumAngles", 1500)
@@ -144,6 +184,15 @@ class FakeBeamline(PVGroup):
              f"file={self.file_name.value!r}  ({dur:.1f}s simulated)")
         self._abort.clear()
         await self.scan_status.write("Scanning")
+        # Flats, then back to SampleIn — where the projections really are.
+        tx, ty = float(self.sample_in_x.value), float(self.sample_in_y.value)
+        if abs(tx - STATE["m1"]) > 1e-4 or abs(ty - STATE["m2"]) > 1e-4:
+            _log(f"  ⚠ SampleIn X={tx:.4f} Y={ty:.4f} differs from the current "
+                 f"position — TomoScan moves the sample there after flats")
+        for name, inst, tgt in (("m1", self.m1, tx), ("m2", self.m2, ty)):
+            self.start_move(name, inst, tgt)
+        await asyncio.gather(*(t for t in self._moves.values() if not t.done()))
+        _log(f"  projections at X={STATE['m1']:.4f} Y={STATE['m2']:.4f}")
         try:
             await asyncio.wait_for(self._abort.wait(), timeout=dur)
             _log("SCAN ABORTED")

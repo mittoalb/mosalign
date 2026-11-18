@@ -1040,6 +1040,24 @@ class TileRunWorker(QtCore.QThread):
                             continue
                         time.sleep(0.1 if self.dialog.test_mode else settle)
 
+                        # TomoScan moves the sample to SampleInX/Y after
+                        # flat fields, so point those at this tile (where
+                        # its sample motors are now). Restored with the
+                        # overrides below.
+                        for axis in (() if self.dialog.test_mode else ("X", "Y")):
+                            key = f"SampleIn{axis}"
+                            motor = self.dialog._caget(f"{tomo_prefix}Sample{axis}PVName")
+                            here = self.dialog._caget(f"{motor}.RBV") if motor else None
+                            if here is None:
+                                self.log_signal.emit(
+                                    f"  ⚠ cannot read TomoScan Sample{axis} motor — "
+                                    f"{key} unchanged")
+                                continue
+                            override_backup.setdefault(
+                                key, self.dialog._caget(f"{tomo_prefix}{key}"))
+                            self.dialog._caput(f"{tomo_prefix}{key}", here, timeout=5)
+                            self.log_signal.emit(f"  {key} = {here}")
+
                         for k, v in tile.overrides.items():
                             self.log_signal.emit(
                                 f"  override {tomo_prefix}{k} = {v}")
