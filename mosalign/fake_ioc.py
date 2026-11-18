@@ -124,6 +124,28 @@ class FakeBeamline(PVGroup):
     image_mode = logged("cam1:ImageMode", 0)
     num_images = logged("cam1:NumImages", 1)
     shutter = logged("shutter", 0)            # fast shutter stand-in
+
+    # B-station shutter stand-in: write 1 to open/close, status 1 = closed
+    # (like PB:32ID:STA_B_SBS_CLSD_PL), reached after a 1.5 s stroke.
+    b_open = pvproperty(name="bshutter:open", value=0)
+    b_close = pvproperty(name="bshutter:close", value=0)
+    b_closed = pvproperty(name="bshutter:closed", value=0)
+
+    @b_open.putter
+    async def b_open(self, instance, value):
+        _log("B SHUTTER open requested")
+        await asyncio.sleep(1.5)
+        await self.b_closed.write(0)
+        _log("B SHUTTER open")
+        return 0
+
+    @b_close.putter
+    async def b_close(self, instance, value):
+        _log("B SHUTTER close requested")
+        await asyncio.sleep(1.5)
+        await self.b_closed.write(1)
+        _log("B SHUTTER closed")
+        return 0
     acquire = pvproperty(name="cam1:Acquire", value=0)
     xanes_start = logged("TXMOptics:XanesStart", 10.2, precision=4)
     xanes_end = logged("TXMOptics:XanesEnd", 10.3, precision=4)
