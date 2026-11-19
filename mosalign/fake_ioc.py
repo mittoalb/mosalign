@@ -162,24 +162,28 @@ class FakeBeamline(PVGroup):
 
     @acquire.putter
     async def acquire(self, instance, value):
-        """Like ADSpinnaker in Single mode: a trigger while still busy is
-        ignored; the frame reaches the PVA stream ~0.3 s BEFORE Acquire goes
-        back to 0 (plugin callbacks run before the driver finishes)."""
+        """Like ADSpinnaker in Single mode: Acquire reads 1 while the frame is
+        being taken; a trigger while busy is ignored; the frame reaches the
+        PVA stream ~0.3 s BEFORE Acquire goes back to 0."""
         if not value:
             return 0
         if STATE["acquiring"]:
             _log("ACQUIRE ignored — camera still busy")
             return 1
         STATE["acquiring"] = True
-        try:
-            _log(f"ACQUIRE image at X={STATE['m1']:.4f} Y={STATE['m2']:.4f} "
-                 f"rot={STATE['m3']:.2f}  ({self.acquire_time.value} s)")
-            await asyncio.sleep(float(self.acquire_time.value))
-            STATE["trigger"] += 1          # frame published now…
-            await asyncio.sleep(0.3)       # …driver done a bit later
-        finally:
-            STATE["acquiring"] = False
-        return 0
+        _log(f"ACQUIRE image at X={STATE['m1']:.4f} Y={STATE['m2']:.4f} "
+             f"rot={STATE['m3']:.2f}  ({self.acquire_time.value} s)")
+
+        async def expose():
+            try:
+                await asyncio.sleep(float(self.acquire_time.value))
+                STATE["trigger"] += 1          # frame published now…
+                await asyncio.sleep(0.3)       # …driver done a bit later
+            finally:
+                STATE["acquiring"] = False
+                await self.acquire.write(0)
+        asyncio.get_event_loop().create_task(expose())
+        return 1
 
     exposure = logged("TomoScan:ExposureTime", 0.1, precision=3)
     num_angles = logged("TomoScan:NumAngles", 1500)
