@@ -34,7 +34,10 @@ import numpy as np
 from caproto import ChannelType
 from caproto.server import PVGroup, pvproperty, run
 
-STATE = {"m1": 0.0, "m2": 0.0, "m3": 0.0}   # live motor readbacks (mm, m3 deg)
+STATE = {"m1": 0.0, "m2": 0.0, "m3": 0.0,   # live motor readbacks (mm, m3 deg)
+         "single": False,     # camera ImageMode Single: frames only on trigger
+         "trigger": 0,        # bumped once per triggered frame
+         "acquiring": False}
 
 
 def _log(msg: str):
@@ -121,7 +124,13 @@ class FakeBeamline(PVGroup):
 
     # Camera (single-image acquisition) and XANES energy range PVs.
     acquire_time = logged("cam1:AcquireTime", 0.1, precision=3)
-    image_mode = logged("cam1:ImageMode", 0)
+    image_mode = pvproperty(name="cam1:ImageMode", value=2)   # 0 Single, 2 Continuous
+
+    @image_mode.putter
+    async def image_mode(self, instance, value):
+        _log(f"put {instance.pvname} = {value}")
+        STATE["single"] = (int(value) == 0)
+        return value
     num_images = logged("cam1:NumImages", 1)
     shutter = logged("shutter", 0)            # fast shutter stand-in
 
@@ -153,10 +162,23 @@ class FakeBeamline(PVGroup):
 
     @acquire.putter
     async def acquire(self, instance, value):
-        if value:
+        """Like ADSpinnaker in Single mode: a trigger while still busy is
+        ignored; the frame reaches the PVA stream ~0.3 s BEFORE Acquire goes
+        back to 0 (plugin callbacks run before the driver finishes)."""
+        if not value:
+            return 0
+        if STATE["acquiring"]:
+            _log("ACQUIRE ignored — camera still busy")
+            return 1
+        STATE["acquiring"] = True
+        try:
             _log(f"ACQUIRE image at X={STATE['m1']:.4f} Y={STATE['m2']:.4f} "
                  f"rot={STATE['m3']:.2f}  ({self.acquire_time.value} s)")
             await asyncio.sleep(float(self.acquire_time.value))
+            STATE["trigger"] += 1          # frame published now…
+            await asyncio.sleep(0.3)       # …driver done a bit later
+        finally:
+            STATE["acquiring"] = False
         return 0
 
     exposure = logged("TomoScan:ExposureTime", 0.1, precision=3)
@@ -306,9 +328,16 @@ def serve_image(pv_name, w, h, pixel_um, rate_hz):
         return a
 
     server = pva.PvaServer(pv_name, frame(0))
-    uid = 0
+    uid, seen = 0, STATE["trigger"]
     while True:
-        uid += 1
+        if STATE["single"]:            # Single mode: one frame per trigger
+            if STATE["trigger"] != seen:
+                seen = STATE["trigger"]
+                uid += 1
+                server.update(pv_name, frame(uid))
+            time.sleep(0.01)
+            continue
+        uid += 1                       # Continuous: free-running stream
         server.update(pv_name, frame(uid))
         time.sleep(1.0 / rate_hz)
 
