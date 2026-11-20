@@ -156,6 +156,28 @@ class FakeBeamline(PVGroup):
         _log("B SHUTTER closed")
         return 0
     acquire = pvproperty(name="cam1:Acquire", value=0)
+    # TXMOptics energy change: EnergySet is a busy record — the server moves
+    # mono / undulator / optics and puts it back to 0 when done (here 2 s);
+    # the readback only reaches the new energy at the end.
+    energy = logged("TXMOptics:Energy", 8.34, precision=4)
+    energy_rbv = pvproperty(name="TXMOptics:Energy_RBV", value=8.34, precision=4)
+    energy_set = pvproperty(name="TXMOptics:EnergySet", value=0)
+
+    @energy_set.putter
+    async def energy_set(self, instance, value):
+        if not value:
+            return 0
+        target = float(self.energy.value)
+        _log(f"ENERGY change to {target:.4f} keV started")
+
+        async def change():
+            await asyncio.sleep(2.0)
+            await self.energy_rbv.write(target)
+            await self.energy_set.write(0)
+            _log(f"ENERGY change done ({target:.4f} keV)")
+        asyncio.get_event_loop().create_task(change())
+        return 1
+
     xanes_start = logged("TXMOptics:XanesStart", 10.2, precision=4)
     xanes_end = logged("TXMOptics:XanesEnd", 10.3, precision=4)
     xanes_step = logged("TXMOptics:XanesStep", 10.0)
