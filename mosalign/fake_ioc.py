@@ -3,13 +3,14 @@
 Serves every PV mosalign touches, under one prefix (default ``mosfake:``),
 and prints each write so you can watch what mosalign does:
 
-  CA   <P>m1, <P>m2                       motor records; .RBV ramps to VAL
+  CA   <P>m1, <P>m2, <P>m4 (X, Y, Z)      motor records; .RBV ramps to VAL
+  CA   <P>m3                              rotation (deg), 30x faster
   CA   <P>TomoScan:ExposureTime, NumAngles, RotationStart/Step/Stop,
        FileName, StartScan, AbortScan, ScanStatus, ServerRunning
   CA   <P>TXMOptics:CropLeft/Right/Top/Bottom, Crop
   CA   <P>cam1:MaxSizeX_RBV, MaxSizeY_RBV
-  PVA  <P>Pva1:Image                      NTNDArray: a synthetic sample seen
-                                          at the current m1/m2 position
+  PVA  <P>Pva1:Image                      NTNDArray: a synthetic 3-D sample
+                                          seen at the current X/Y/Z and angle
 
 StartScan behaves like TomoScan's busy record: `caput -c` returns when the
 simulated scan ends (NumAngles x ExposureTime / --speedup seconds) or when
@@ -18,6 +19,7 @@ AbortScan is written.
 Run:   mosalign-fake-ioc            (or: python -m mosalign.fake_ioc)
 Then in mosalign set
   Motor 1 PV      mosfake:m1          Motor 2 PV   mosfake:m2
+  Motor 3 PV      mosfake:m4          Rotation     mosfake:m3
   Image PV        mosfake:Pva1:Image  TomoScan     mosfake:TomoScan:
   Camera prefix   mosfake:cam1        Crop prefix  mosfake:TXMOptics
 For production, put the real PV names back in the same fields.
@@ -34,7 +36,7 @@ import numpy as np
 from caproto import ChannelType
 from caproto.server import PVGroup, pvproperty, run
 
-STATE = {"m1": 0.0, "m2": 0.0, "m3": 0.0,   # live motor readbacks (mm, m3 deg)
+STATE = {"m1": 0.0, "m2": 0.0, "m3": 0.0, "m4": 0.0,  # readbacks (mm; m3 deg)
          "single": False,     # camera ImageMode Single: frames only on trigger
          "trigger": 0,        # bumped once per triggered frame
          "acquiring": False}
@@ -74,6 +76,7 @@ class FakeBeamline(PVGroup):
     m1 = motor("m1")
     m2 = motor("m2")
     m3 = motor("m3")      # rotation
+    m4 = motor("m4")      # Z: horizontal on the camera at 90°
 
     # TomoScan's sample motors are m1/m2 (names written at startup). After
     # flat fields TomoScan moves the sample to SampleInX/Y — emulated in
@@ -259,14 +262,14 @@ class FakeBeamline(PVGroup):
             instance.field_inst.done_moving_to_value
         await dmov.write(0)
         dt = 0.05
-        step = self.velocity * dt
+        step = self.velocity * dt * (30.0 if name == "m3" else 1.0)
         while abs(STATE[name] - target) > 1e-9:
             d = target - STATE[name]
             STATE[name] = target if abs(d) <= step else STATE[name] + np.sign(d) * step
             await rbv.write(STATE[name])
             await asyncio.sleep(dt)
         await dmov.write(1)
-        _log(f"  {instance.pvname} at {target:.4f} mm")
+        _log(f"  {instance.pvname} at {target:.4f} {'deg' if name == 'm3' else 'mm'}")
 
     # ── TomoScan busy record ───────────────────────────────────────────
 
@@ -311,17 +314,21 @@ class FakeBeamline(PVGroup):
 
 # ── synthetic camera on pvAccess ───────────────────────────────────────
 
-def _sample(xmm, ymm):
-    """Sample intensity at absolute stage coordinates (mm): a 0.1 mm grid,
-    heavier lines every 0.5 mm, and fixed random blobs, so a misplaced
-    frame shows up as a broken line in the mosaic."""
+def _sample(xmm, ymm, theta_deg=0.0):
+    """Projection at angle theta of a sample on X/Z stages that sit on the
+    rotation: column coordinate xmm = camera column + X·cosθ + Z·sinθ.
+    A 0.1 mm grid, heavier lines every 0.5 mm, and fixed random 3-D blobs
+    (projected), so a misplaced frame shows up as a broken line or a cut
+    blob in the mosaic. At θ = 0 this is the plain X/Y sample."""
+    th = np.radians(theta_deg)
     img = 2000 + 300 * np.sin(xmm * 3.0) * np.cos(ymm * 2.0)
     for period, width, amp in ((0.1, 0.003, 4000), (0.5, 0.008, 8000)):
         on_x = np.abs((xmm + period / 2) % period - period / 2) < width
         on_y = np.abs((ymm + period / 2) % period - period / 2) < width
         img = img + amp * (on_x | on_y)
     x0, x1, y0, y1 = xmm.min(), xmm.max(), ymm.min(), ymm.max()
-    for bx, by, r in _BLOBS:
+    for ba, bb, by, r in _BLOBS:
+        bx = ba * np.cos(th) + bb * np.sin(th)
         if not (x0 - 4 * r < bx < x1 + 4 * r and y0 - 4 * r < by < y1 + 4 * r):
             continue
         img = img + 15000 * np.exp(-((xmm - bx) ** 2 + (ymm - by) ** 2) / (2 * r * r))
@@ -329,9 +336,10 @@ def _sample(xmm, ymm):
 
 
 _rng = np.random.default_rng(0)
-_BLOBS = [(x, y, r) for x, y, r in zip(_rng.uniform(-5, 5, 400),
-                                        _rng.uniform(-5, 5, 400),
-                                        _rng.uniform(0.01, 0.04, 400))]
+_BLOBS = [(a, b, y, r) for a, y, r, b in zip(_rng.uniform(-5, 5, 400),
+                                              _rng.uniform(-5, 5, 400),
+                                              _rng.uniform(0.01, 0.04, 400),
+                                              _rng.uniform(-5, 5, 400))]
 
 
 def serve_image(pv_name, w, h, pixel_um, rate_hz):
@@ -344,9 +352,11 @@ def serve_image(pv_name, w, h, pixel_um, rate_hz):
 
     def frame(uid):
         a = pva.NtNdArray()
-        X = STATE["m1"] + cols[None, :]
+        th = np.radians(STATE["m3"])
+        u = STATE["m1"] * np.cos(th) + STATE["m4"] * np.sin(th)
+        X = u + cols[None, :]
         Y = STATE["m2"] + rows[:, None]
-        a["value"] = {"ushortValue": _sample(X, Y).ravel()}
+        a["value"] = {"ushortValue": _sample(X, Y, STATE["m3"]).ravel()}
         dim = lambda n: {"size": n, "offset": 0, "fullSize": n,
                          "binning": 1, "reverse": False}
         a["dimension"] = [dim(w), dim(h)]

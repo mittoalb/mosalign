@@ -7,11 +7,14 @@ Performs 2D motor scan with live stitched preview.
 
 Features:
 - X-Y motor grid scan with image stitching
+- Optional second preview at another angle (90°: Z × Y grid; 180°: X × Y,
+  for double field of view); tiles are edited in both mosaics
 - Tomoscan integration at each position
 - Test mode for offline development
 """
 
 import logging
+import math
 import os
 import subprocess
 import time
@@ -112,8 +115,9 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.scan_thread = None
         self.current_image = None
 
-        # For stitched preview
+        # For stitched preview (stitched_image_b: second-angle mosaic)
         self.stitched_image = None
+        self.stitched_image_b = None
         self.stitched_lock = QtCore.QMutex()
 
         # Interactive tiles (created after view_box exists in _build_ui)
@@ -121,6 +125,7 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.tile_run_worker: Optional[TileRunWorker] = None
         # Last grid-scan geometry, stashed by ScanWorker for seed_from_grid
         self._last_scan_geom: Optional[dict] = None
+        self._last_scan_geom_b: Optional[dict] = None
 
         # Test/Mock mode
         self.test_mode = False
@@ -141,6 +146,7 @@ class MotorScanDialog(QtWidgets.QDialog):
 
         self._build_ui()
         self._load_config()
+        self._update_angle_info()
 
         self._on_preview_toggled(self.enable_preview.isChecked())
         self.image_pv.editingFinished.connect(self._restart_camera)
@@ -193,11 +199,22 @@ class MotorScanDialog(QtWidgets.QDialog):
         tile_btns.addWidget(self.stop_btn)
 
         self.graphics_view = pg.GraphicsLayoutWidget()
-        self.graphics_view.setMinimumSize(400, 400)  # Ensure preview is visible
-        self.view_box = self.graphics_view.addViewBox()
+        self.graphics_view.setMinimumSize(300, 400)  # Ensure preview is visible
+        self.title_a = self.graphics_view.addLabel("", row=0, col=0)
+        self.view_box = self.graphics_view.addViewBox(row=1, col=0)
         self.view_box.setAspectLocked(True)
         self.image_view = pg.ImageItem()
         self.view_box.addItem(self.image_view)
+
+        # Second-angle mosaic (90° / 180°), shown next to the first one
+        self.graphics_view_b = pg.GraphicsLayoutWidget()
+        self.graphics_view_b.setMinimumSize(300, 400)
+        self.title_b = self.graphics_view_b.addLabel("", row=0, col=0)
+        self.view_box_b = self.graphics_view_b.addViewBox(row=1, col=0)
+        self.view_box_b.setAspectLocked(True)
+        self.image_view_b = pg.ImageItem()
+        self.view_box_b.addItem(self.image_view_b)
+        self.graphics_view_b.setVisible(False)
 
         # Tile buttons stay disabled until a grid scan completes (and
         # _scan_finished seeds the tile manager).
@@ -244,13 +261,23 @@ class MotorScanDialog(QtWidgets.QDialog):
         # Tile manager owns ROIs on view_box; created here so it's ready for
         # config-load-time restore_rois() calls.
         self.tile_manager = TileManager(self.view_box, self)
+        # The same tiles on the second-angle mosaic: dragging there sets Z
+        # (90°) or X (180°); Y is shared. Each view follows the other.
+        self.tile_manager_b = TileManager(self.view_box_b, self, h_attr="z_mm",
+                                          primary=self.tile_manager)
+        self.tile_manager.link(self.tile_manager_b)
+        self.tile_manager_b.link(self.tile_manager)
 
         # Canvas + side panel in a resizable horizontal splitter.
         # Side panel shows the currently-selected tile's motor X/Y +
         # NumAngles / ExposureTime overrides; double-click a tile to edit.
         self.tile_side_panel = TileSidePanel(self.tile_manager, parent=self)
+        self.tile_side_panel.add_view(self.tile_manager_b)
+        views = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        views.addWidget(self.graphics_view)
+        views.addWidget(self.graphics_view_b)
         canvas_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        canvas_splitter.addWidget(self.graphics_view)
+        canvas_splitter.addWidget(views)
         canvas_splitter.addWidget(self.tile_side_panel)
         canvas_splitter.setStretchFactor(0, 1)
         canvas_splitter.setStretchFactor(1, 0)
@@ -333,13 +360,40 @@ class MotorScanDialog(QtWidgets.QDialog):
                 lbl.setVisible(not live)
         self._live_levels = None
         self._live_autorange = True
+        self._update_view_titles(live)
         if live:
             self.image_view.clear()
         else:
             self._preview_initialized_view = False
-            if hasattr(self, "_preview_initialized"):
-                delattr(self, "_preview_initialized")
+            for attr in ("_preview_initialized", "_preview_initialized_b"):
+                if hasattr(self, attr):
+                    delattr(self, attr)
             self._refresh_stitched_preview()
+
+    def _has_view_b(self) -> bool:
+        return (self.stitched_image_b is not None
+                or (self.tile_manager_b is not None and bool(self.tile_manager_b.is_active())))
+
+    def _update_view_titles(self, live: Optional[bool] = None):
+        if live is None:
+            live = self._live_mode()
+        show_b = (not live) and self._has_view_b()
+        self.graphics_view_b.setVisible(show_b)
+        if live:
+            self.title_a.setText("Live camera")
+            return
+        ga = self._last_scan_geom or {}
+        gb = self._last_scan_geom_b or {}
+        if show_b:
+            self.title_a.setText(f"{ga.get('angle', self.angle_a.value()):g}°  —  X × Y")
+            attr = gb.get("h_attr", self.tile_manager_b.h_attr)
+            sign = gb.get("h_sign", self.tile_manager_b.h_sign)
+            motor = "Z" if attr == "z_mm" else "X"
+            note = "  (reversed)" if sign < 0 else ""
+            self.title_b.setText(f"{gb.get('angle', self.angle_b.value()):g}°  —  "
+                                 f"{motor} × Y{note}")
+        else:
+            self.title_a.setText("Mosaic")
 
     def _on_live_frame(self, img):
         if not self._live_mode():
@@ -405,8 +459,62 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.y_step_size.setValue(3)
         params_layout.addWidget(self.y_step_size, 2, 3)
 
+        # Z: only used by a 90° second-angle preview
+        self.z_label = QtWidgets.QLabel("Z:")
+        self.z_label.setToolTip("Horizontal motor seen at 90° — the grid of the 90° preview")
+        params_layout.addWidget(self.z_label, 3, 0)
+        self.z_start = QtWidgets.QDoubleSpinBox()
+        self.z_start.setRange(-1000, 1000)
+        self.z_start.setDecimals(3)
+        params_layout.addWidget(self.z_start, 3, 1)
+        self.z_step = QtWidgets.QDoubleSpinBox()
+        self.z_step.setRange(-1000, 1000)
+        self.z_step.setDecimals(3)
+        self.z_step.setValue(4.0)
+        params_layout.addWidget(self.z_step, 3, 2)
+        self.z_step_size = QtWidgets.QSpinBox()
+        self.z_step_size.setRange(1, 1000)
+        self.z_step_size.setValue(2)
+        params_layout.addWidget(self.z_step_size, 3, 3)
+
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
+
+        # Second angle: preview the sample also at angle B
+        angle_group = QtWidgets.QGroupBox("Second angle")
+        angle_form = QtWidgets.QFormLayout()
+        self.two_angle = QtWidgets.QCheckBox("Also preview at a second angle")
+        self.two_angle.setToolTip(
+            "After the X × Y mosaic at angle A, rotate to angle B and take a second "
+            "mosaic. Near 90° it scans Z × Y (Z = horizontal motor at 90°); near 180° "
+            "it scans X × Y again (double field of view). Then back to angle A.")
+        angle_form.addRow(self.two_angle)
+        self.angle_a = QtWidgets.QDoubleSpinBox()
+        self.angle_a.setRange(-720, 720)
+        self.angle_a.setDecimals(2)
+        self.angle_a.setSuffix(" °")
+        self.angle_a.setValue(0.0)
+        angle_form.addRow("Angle A:", self.angle_a)
+        self.angle_b = QtWidgets.QDoubleSpinBox()
+        self.angle_b.setRange(-720, 720)
+        self.angle_b.setDecimals(2)
+        self.angle_b.setSuffix(" °")
+        self.angle_b.setValue(90.0)
+        angle_form.addRow("Angle B:", self.angle_b)
+        self.reverse_b = QtWidgets.QCheckBox("Reverse direction at angle B")
+        self.reverse_b.setToolTip("Tick if the frames of the angle-B mosaic do not join "
+                                  "up (the motor moves the sample the other way on the "
+                                  "camera than assumed).")
+        angle_form.addRow(self.reverse_b)
+        self.angle_info = QtWidgets.QLabel("")
+        self.angle_info.setWordWrap(True)
+        angle_form.addRow(self.angle_info)
+        angle_group.setLayout(angle_form)
+        layout.addWidget(angle_group)
+        for w_ in (self.two_angle, self.reverse_b):
+            w_.toggled.connect(self._update_angle_info)
+        for w_ in (self.angle_a, self.angle_b):
+            w_.valueChanged.connect(self._update_angle_info)
 
         # Operational settings (scan timing + test mode + tomoscan mode)
         settings_group = QtWidgets.QGroupBox("Settings")
@@ -493,8 +601,15 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.motor2_pv.setPlaceholderText("vertical motor PV")
         self.tomoscan_path = QtWidgets.QLineEdit("tomoscan")
 
+        self.motor3_pv = QtWidgets.QLineEdit("")
+        self.motor3_pv.setPlaceholderText("horizontal motor at 90° (for a 90° preview)")
+        self.rotation_pv = QtWidgets.QLineEdit("32idbTXM:ens:c1:m1")
+        self.rotation_pv.setPlaceholderText("rotation motor PV (second-angle preview)")
+
         pv_layout.addRow("Motor 1 (X):",   self.motor1_pv)
         pv_layout.addRow("Motor 2 (Y):",   self.motor2_pv)
+        pv_layout.addRow("Motor 3 (Z):",   self.motor3_pv)
+        pv_layout.addRow("Rotation:",      self.rotation_pv)
         pv_layout.addRow("Tomoscan Path:", self.tomoscan_path)
 
         pv_group.setLayout(pv_layout)
@@ -547,6 +662,17 @@ class MotorScanDialog(QtWidgets.QDialog):
                     self.motor1_pv.setText(config['motor1_pv'])
                 if 'motor2_pv' in config:
                     self.motor2_pv.setText(config['motor2_pv'])
+                for key in ('motor3_pv', 'rotation_pv'):
+                    if key in config:
+                        getattr(self, key).setText(config[key])
+                for key in ('z_start', 'z_step', 'angle_a', 'angle_b'):
+                    if key in config:
+                        getattr(self, key).setValue(float(config[key]))
+                if 'z_step_size' in config:
+                    self.z_step_size.setValue(int(config['z_step_size']))
+                for key in ('two_angle', 'reverse_b'):
+                    if key in config:
+                        getattr(self, key).setChecked(bool(config[key]))
                 if 'tomoscan_path' in config:
                     self.tomoscan_path.setText(config['tomoscan_path'])
                 if 'image_pv' in config:
@@ -589,6 +715,10 @@ class MotorScanDialog(QtWidgets.QDialog):
                     try:
                         self.tile_manager.deserialize(tile_state)
                         self.tile_manager.restore_rois()
+                        snap_b = config.get('tiles_b')
+                        if snap_b:
+                            self.tile_manager_b.deserialize({"snapshot": snap_b})
+                            self.tile_manager_b.restore_rois()
                         if self.tile_manager.tiles:
                             self.add_tile_btn.setEnabled(True)
                             self.run_tiles_btn.setEnabled(True)
@@ -614,6 +744,15 @@ class MotorScanDialog(QtWidgets.QDialog):
         config = {
             'motor1_pv': self.motor1_pv.text(),
             'motor2_pv': self.motor2_pv.text(),
+            'motor3_pv': self.motor3_pv.text(),
+            'rotation_pv': self.rotation_pv.text(),
+            'z_start': self.z_start.value(),
+            'z_step': self.z_step.value(),
+            'z_step_size': self.z_step_size.value(),
+            'two_angle': self.two_angle.isChecked(),
+            'angle_a': self.angle_a.value(),
+            'angle_b': self.angle_b.value(),
+            'reverse_b': self.reverse_b.isChecked(),
             'tomoscan_path': self.tomoscan_path.text(),
             'image_pv': self.image_pv.text(),
             'tomoscan_prefix': self.tomoscan_prefix.text(),
@@ -631,6 +770,9 @@ class MotorScanDialog(QtWidgets.QDialog):
             'tile_timeout': self.tile_timeout.value(),
             'tiles': (self.tile_manager.serialize()
                       if self.tile_manager is not None else None),
+            'tiles_b': (self.tile_manager_b.serialize()["snapshot"]
+                        if self.tile_manager_b is not None
+                        and self.tile_manager_b.is_active() else None),
         }
 
         try:
@@ -732,41 +874,52 @@ class MotorScanDialog(QtWidgets.QDialog):
         if not self.enable_preview.isChecked() or self._live_mode():
             return
 
+        if self.graphics_view_b.isHidden() == self._has_view_b():
+            self._update_view_titles()          # angle-B mosaic started / gone
         self.stitched_lock.lock()
         try:
-            if self.stitched_image is not None:
-                # Flip vertically to correct display orientation
-                img = np.flipud(self.stitched_image.copy())
-
-                # Use percentile-based contrast on actual data
-                if self.auto_contrast.isChecked():
-                    # Exclude zeros (unfilled canvas) and extreme values (frame borders)
-                    # Use a more conservative threshold to exclude background
-                    nz = img[img > 100]  # Exclude near-zero background
-                    if nz.size > 100:  # Need enough pixels for good statistics
-                        # Use narrower percentile range for better contrast
-                        vmin, vmax = np.percentile(nz, [0.5, 99.5])
-                        # Ensure reasonable dynamic range
-                        if vmax - vmin < 1000:
-                            # Expand range if too narrow
-                            mean_val = np.mean(nz)
-                            vmin = max(0, mean_val - 10000)
-                            vmax = min(65535, mean_val + 10000)
-                    else:
-                        # Fallback for mostly empty canvas
-                        vmin, vmax = 0, 65535
-                    self.image_view.setImage(img, levels=[vmin, vmax])
-                else:
-                    self.image_view.setImage(img)
-
-                # Auto-range on first update
-                if not hasattr(self, '_preview_initialized'):
-                    self.view_box.autoRange()
-                    self._preview_initialized = True
+            self._render_mosaic(self.stitched_image, self.image_view,
+                                self.view_box, "_preview_initialized")
+            self._render_mosaic(self.stitched_image_b, self.image_view_b,
+                                self.view_box_b, "_preview_initialized_b")
         except Exception as e:
             self._log(f"Preview error: {e}")
         finally:
             self.stitched_lock.unlock()
+
+    def _render_mosaic(self, stitched, image_item, view_box, init_attr):
+        """Show one stitched canvas (caller holds stitched_lock)."""
+        if stitched is None:
+            image_item.clear()
+            return
+        # Flip vertically to correct display orientation
+        img = np.flipud(stitched.copy())
+
+        # Use percentile-based contrast on actual data
+        if self.auto_contrast.isChecked():
+            # Exclude zeros (unfilled canvas) and extreme values (frame borders)
+            # Use a more conservative threshold to exclude background
+            nz = img[img > 100]  # Exclude near-zero background
+            if nz.size > 100:  # Need enough pixels for good statistics
+                # Use narrower percentile range for better contrast
+                vmin, vmax = np.percentile(nz, [0.5, 99.5])
+                # Ensure reasonable dynamic range
+                if vmax - vmin < 1000:
+                    # Expand range if too narrow
+                    mean_val = np.mean(nz)
+                    vmin = max(0, mean_val - 10000)
+                    vmax = min(65535, mean_val + 10000)
+            else:
+                # Fallback for mostly empty canvas
+                vmin, vmax = 0, 65535
+            image_item.setImage(img, levels=[vmin, vmax])
+        else:
+            image_item.setImage(img)
+
+        # Auto-range on first update
+        if not hasattr(self, init_attr):
+            view_box.autoRange()
+            setattr(self, init_attr, True)
 
     # ── frame capture ───────────────────────────────────────────────────
     #
@@ -958,10 +1111,74 @@ class MotorScanDialog(QtWidgets.QDialog):
         self._log("⚠ Set both X and Y motor PVs first.")
         return False
 
+    def _second_view(self) -> Optional[dict]:
+        """What the angle-B preview scans, or None when it is off.
+
+        The motor that is horizontal on the camera at angle B is X when B is
+        nearer to A ± 180° (or A) and Z when it is nearer to A ± 90°; `sign`
+        is -1 when that motor moves the sample the other way on the camera
+        than X does at angle A (X at 180°)."""
+        if not self.two_angle.isChecked():
+            return None
+        d = math.radians(self.angle_b.value() - self.angle_a.value())
+        c, sn = math.cos(d), math.sin(d)
+        if abs(c) >= abs(sn):
+            v = dict(h_attr="x_mm", motor="X", pv=self.motor1_pv.text().strip(),
+                     start=self.x_start.value(), step=self.x_step.value(),
+                     n=self.x_step_size.value(), sign=1 if c > 0 else -1)
+        else:
+            v = dict(h_attr="z_mm", motor="Z", pv=self.motor3_pv.text().strip(),
+                     start=self.z_start.value(), step=self.z_step.value(),
+                     n=self.z_step_size.value(), sign=1 if sn > 0 else -1)
+        if self.reverse_b.isChecked():
+            v["sign"] = -v["sign"]
+        v["angle_a"] = self.angle_a.value()
+        v["angle_b"] = self.angle_b.value()
+        return v
+
+    def _update_angle_info(self, *_):
+        v = self._second_view()
+        on = v is not None
+        for w_ in (self.angle_a, self.angle_b, self.reverse_b):
+            w_.setEnabled(on)
+        uses_z = on and v["h_attr"] == "z_mm"
+        for w_ in (self.z_label, self.z_start, self.z_step, self.z_step_size):
+            w_.setEnabled(uses_z)
+        if not on:
+            self.angle_info.setText("")
+            return
+        if uses_z:
+            txt = (f"At {v['angle_b']:g}°: Z × Y grid (Z row above, Motor 3 PV). "
+                   f"X stays at the centre of its range")
+        else:
+            txt = f"At {v['angle_b']:g}°: the same X × Y grid"
+        if v["sign"] < 0:
+            txt += " — X/Z moves the image the other way, the mosaic is mirrored"
+        self.angle_info.setText(txt + ".")
+
+    def _second_view_ready(self) -> bool:
+        v = self._second_view()
+        if v is None or self.test_mode:
+            return True
+        if not self.rotation_pv.text().strip():
+            self._log("⚠ Second angle: set the Rotation PV (PVs tab) first.")
+            return False
+        if not v["pv"]:
+            self._log(f"⚠ Second angle at {v['angle_b']:g}° scans Z: set Motor 3 (Z) "
+                      f"on the PVs tab first.")
+            return False
+        return True
+
     def _start_scan(self):
         """Start the 2D motor scan"""
-        if not self._motors_configured():
+        if not self._motors_configured() or not self._second_view_ready():
             return
+        self.stitched_lock.lock()
+        self.stitched_image_b = None
+        self.stitched_lock.unlock()
+        self._last_scan_geom_b = None
+        self.tile_manager_b.x_start_mm = None     # old angle-B tiles go
+        self.tile_manager_b.restore_rois()
         self._set_view_mode(live=False)      # show the mosaic being built
         self.scanning = True
         self.start_btn.setEnabled(False)
@@ -977,6 +1194,8 @@ class MotorScanDialog(QtWidgets.QDialog):
                 delattr(self, attr)
 
         if self.enable_preview.isChecked():
+            if not self.preview_timer.isActive():   # stopped by the last scan
+                self.preview_timer.start(500)
             self._log("Preview timer active (500ms refresh)")
         else:
             self._log("Live preview disabled - no mosaic display")
@@ -1102,11 +1321,25 @@ class MotorScanDialog(QtWidgets.QDialog):
                     img_w=geom["img_w"], img_h=geom["img_h"],
                     out_h=geom["out_h"],
                     sensor_w=sensor_w, sensor_h=sensor_h,
+                    z_mm=geom.get("z_mm"),
                 )
+                gb = self._last_scan_geom_b
+                tmb = self.tile_manager_b
+                if gb:
+                    tmb.set_geometry(h_start=gb["h_start"], y_start=gb["y_start"],
+                                     pixel_size_um=gb["pixel_size_um"],
+                                     img_w=gb["img_w"], img_h=gb["img_h"],
+                                     out_h=gb["out_h"], sensor_w=sensor_w,
+                                     sensor_h=sensor_h, h_attr=gb["h_attr"],
+                                     h_sign=gb["h_sign"])
+                else:
+                    tmb.x_start_mm = None          # no second-angle mosaic
+                tmb.restore_rois()
                 self.add_tile_btn.setEnabled(True)
                 self.run_tiles_btn.setEnabled(True)
             except Exception as e:
                 self._log(f"⚠ Could not seed tiles: {e}")
+        self._update_view_titles()
 
     def _update_progress(self, current: int, total: int):
         """Update progress bar"""
@@ -1166,135 +1399,50 @@ class ScanWorker(QtCore.QThread):
                 self._run_mosaic_script()
                 return
 
-            motor1_pv = self.dialog.motor1_pv.text().strip()
-            motor2_pv = self.dialog.motor2_pv.text().strip()
+            d = self.dialog
+            motor1_pv = d.motor1_pv.text().strip()
+            motor2_pv = d.motor2_pv.text().strip()
+            x = (d.x_start.value(), d.x_step.value(), d.x_step_size.value())
+            y = (d.y_start.value(), d.y_step.value(), d.y_step_size.value())
+            sv = d._second_view()
+            rot_pv = d.rotation_pv.text().strip()
+            centre = lambda g: g[0] + (g[2] - 1) * g[1] / 2.0
+            uses_z = sv is not None and sv["h_attr"] == "z_mm"
+            z_mid = centre((sv["start"], sv["step"], sv["n"])) if uses_z else None
 
-            x_start = self.dialog.x_start.value()
-            x_step = self.dialog.x_step.value()
-            x_step_size = self.dialog.x_step_size.value()
+            if sv is not None:
+                if not self._rotate(rot_pv, sv["angle_a"]):
+                    return
+                if uses_z:                     # Z out of the way: middle of its range
+                    if not self._move(sv["pv"], z_mid, "Z"):
+                        return
 
-            y_start = self.dialog.y_start.value()
-            y_step = self.dialog.y_step.value()
-            y_step_size = self.dialog.y_step_size.value()
-
-            settle_time = self.dialog.settle_time.value()
-            motor_tolerance = self.dialog.motor_tolerance.value()
-            timeout = self.dialog.caput_timeout.value()
-
-            total_positions = x_step_size * y_step_size
-            position = 0
-
-            self.log_signal.emit(f"Moving to start: X={x_start:.3f}, Y={y_start:.3f}")
-            self.dialog._caput(motor1_pv, x_start, timeout)
-            time.sleep(0.1)
-            self.dialog._caput(motor2_pv, y_start, timeout)
-            time.sleep(settle_time if not self.dialog.test_mode else 0.1)
-
-            # Get test image to determine canvas size
-            self.log_signal.emit("Getting test image...")
-            test_img = self.dialog._get_image_now(0, total_positions)
-
-            if test_img is not None:
-                img_h, img_w = test_img.shape
-
-                pixel_size_um = self.dialog.pixel_size.value()
-                x_step_um = x_step * 1000
-                y_step_um = y_step * 1000
-
-                eff_w = int(x_step_um / pixel_size_um)
-                eff_h = int(y_step_um / pixel_size_um)
-
-                out_w = eff_w * x_step_size + (img_w - eff_w)
-                out_h = eff_h * y_step_size + (img_h - eff_h)
-
-                self.log_signal.emit(
-                    f"Canvas: {out_w}×{out_h}, Image: {img_w}×{img_h}, Step: {eff_w}×{eff_h}px"
-                )
-            else:
-                err = self.dialog._last_capture_error
-                self.log_signal.emit("⚠ Failed to get test image!" + (f" ({err})" if err else ""))
+            geom = self._grid(motor1_pv, x, motor2_pv, y, sign=1, view="a")
+            if geom is None:
                 return
+            geom.update(x_start=x[0], y_start=y[0], x_step=x[1], y_step=y[1],
+                        nx=x[2], ny=y[2], z_mm=z_mid,
+                        angle=sv["angle_a"] if sv else None)
+            d._last_scan_geom = geom
 
-            self.dialog.stitched_lock.lock()
-            self.dialog.stitched_image = np.zeros((out_h, out_w), dtype=np.uint16)
-            self.dialog.stitched_lock.unlock()
-
-            # Stash geometry so _scan_finished can seed the tile manager.
-            # img_w/img_h are the per-frame size; out_h is the full canvas.
-            self.dialog._last_scan_geom = dict(
-                x_start=x_start, y_start=y_start,
-                x_step=x_step, y_step=y_step,
-                nx=x_step_size, ny=y_step_size,
-                pixel_size_um=pixel_size_um,
-                img_w=img_w, img_h=img_h,
-                out_h=out_h,
-            )
-
-            for i in range(x_step_size):
-                if not self.dialog.scanning:
-                    break
-
-                for j in range(y_step_size):
-                    if not self.dialog.scanning:
-                        break
-
-                    x_pos = x_start + (i * x_step)
-                    y_pos = y_start + (j * y_step)
-
-                    position += 1
-
-                    self.log_signal.emit(
-                        f"[{position}/{total_positions}] X={x_pos:.3f}, Y={y_pos:.3f}"
-                    )
-
-                    # Remember the newest frame before moving, so the capture
-                    # below waits for a frame taken at the new position.
-                    uid_before = self.dialog._frame_uid()
-
-                    if not self.dialog.test_mode:
-                        try:
-                            subprocess.run(['caput', motor1_pv, str(x_pos)],
-                                           capture_output=True, timeout=5)
-                            subprocess.run(['caput', motor2_pv, str(y_pos)],
-                                           capture_output=True, timeout=5)
-                        except Exception as e:
-                            self.log_signal.emit(f"  ⚠ Motor error: {e}")
-
-                    at_x = self.dialog._wait_for_motor(motor1_pv, x_pos, motor_tolerance, timeout)
-                    at_y = self.dialog._wait_for_motor(motor2_pv, y_pos, motor_tolerance, timeout)
-
-                    self.position_signal.emit(position, total_positions, x_pos, y_pos, 0)
-
-                    if not (at_x and at_y):
-                        self.log_signal.emit("  ✗ motors did not reach target — frame not captured")
-                        self.progress_signal.emit(position, total_positions)
-                        continue
-
-                    time.sleep(0.1 if self.dialog.test_mode else settle_time)
-
-                    img = None
-                    # The PV path already waits up to 10 s for a fresh frame.
-                    max_retries = 1 if self.dialog.image_pv.text().strip() else 3
-
-                    for retry in range(max_retries):
-                        img = self.dialog._get_image_now(position, total_positions,
-                                                         after_uid=uid_before)
-                        if img is not None:
-                            break
-                        if retry < max_retries - 1:
-                            self.log_signal.emit(f"  ⚠ No image yet, waiting... ({retry+1}/{max_retries})")
-                            time.sleep(0.2)
-
-                    if img is not None:
-                        self._place_image_in_canvas(img, i, j, eff_w, eff_h, out_w, out_h)
-                        self.log_signal.emit(f"  ✓ Image captured and placed in mosaic")
-                    else:
-                        err = self.dialog._last_capture_error
-                        self.log_signal.emit("  ✗ No image available - " + (err or "check camera stream"))
-
-                    self.progress_signal.emit(position, total_positions)
-
-            self.log_signal.emit(f"Scan complete! Total positions: {position}")
+            if sv is not None and d.scanning:
+                self.log_signal.emit("─" * 60)
+                if uses_z:                     # X is along the beam at 90°
+                    if not self._move(motor1_pv, centre(x), "X"):
+                        return
+                if not self._rotate(rot_pv, sv["angle_b"]):
+                    return
+                gb = self._grid(sv["pv"], (sv["start"], sv["step"], sv["n"]),
+                                motor2_pv, y, sign=sv["sign"], view="b",
+                                h_name=sv["motor"])
+                if gb is not None:
+                    gb.update(h_attr=sv["h_attr"], h_sign=sv["sign"],
+                              angle=sv["angle_b"])
+                    d._last_scan_geom_b = gb
+                if d.scanning:
+                    self._rotate(rot_pv, sv["angle_a"])
+                else:
+                    self.log_signal.emit(f"⚠ stopped — rotation left at {sv['angle_b']:g}°")
 
         except Exception as e:
             self.log_signal.emit(f"✗ Scan failed: {e}")
@@ -1302,6 +1450,144 @@ class ScanWorker(QtCore.QThread):
             self.log_signal.emit(traceback.format_exc())
         finally:
             self.finished_signal.emit()
+
+    # ── moves ────────────────────────────────────────────────────────────
+
+    def _move(self, pv: str, target: float, name: str) -> bool:
+        d = self.dialog
+        self.log_signal.emit(f"Move {name} ({pv}) → {target:.3f}")
+        d._caput(pv, target, d.caput_timeout.value())
+        if d._wait_for_motor(pv, target, d.motor_tolerance.value(),
+                             d.caput_timeout.value()):
+            return True
+        self.log_signal.emit(f"✗ {name} did not reach {target:.3f} — scan stopped")
+        return False
+
+    ROT_TOLERANCE_DEG = 0.05
+
+    def _rotate(self, pv: str, angle: float) -> bool:
+        """Rotate the sample and wait until it is there (a 90° turn can take
+        a while, so the timeout is at least 3 min)."""
+        d = self.dialog
+        timeout = max(180.0, d.caput_timeout.value())
+        self.log_signal.emit(f"Rotate ({pv}) → {angle:g}°")
+        d._caput(pv, angle, timeout)
+        if d._wait_for_motor(pv, angle, self.ROT_TOLERANCE_DEG, timeout):
+            time.sleep(0.1 if d.test_mode else d.settle_time.value())
+            return True
+        self.log_signal.emit(f"✗ rotation did not reach {angle:g}° — scan stopped")
+        return False
+
+    def _grid(self, h_pv, h, v_pv, v, sign, view, h_name="X") -> Optional[dict]:
+        """Grid of frames into one mosaic: horizontal motor outer, Y inner.
+
+        h, v: (start, step, steps). `sign` -1 places frames mirrored (the
+        horizontal motor moves the sample the other way on the camera).
+        Fills dialog.stitched_image (view "a") or stitched_image_b ("b")
+        and returns the canvas geometry, or None if no frame could be read.
+        """
+        d = self.dialog
+        settle_time = d.settle_time.value()
+        motor_tolerance = d.motor_tolerance.value()
+        timeout = d.caput_timeout.value()
+        nh, nv = h[2], v[2]
+        total_positions = nh * nv
+        attr = "stitched_image" if view == "a" else "stitched_image_b"
+
+        self.log_signal.emit(f"Moving to start: {h_name}={h[0]:.3f}, Y={v[0]:.3f}")
+        d._caput(h_pv, h[0], timeout)
+        time.sleep(0.1)
+        d._caput(v_pv, v[0], timeout)
+        d._wait_for_motor(h_pv, h[0], motor_tolerance, timeout)
+        d._wait_for_motor(v_pv, v[0], motor_tolerance, timeout)
+        time.sleep(settle_time if not d.test_mode else 0.1)
+
+        # Test image to determine canvas size
+        self.log_signal.emit("Getting test image...")
+        test_img = d._get_image_now(0, total_positions)
+        if test_img is None:
+            err = d._last_capture_error
+            self.log_signal.emit("⚠ Failed to get test image!" + (f" ({err})" if err else ""))
+            return None
+        img_h, img_w = test_img.shape
+        pixel_size_um = d.pixel_size.value()
+        mm_px = 1000.0 / pixel_size_um
+
+        # Canvas left edge = lowest sign×motor value; top (before the display
+        # flip) = lowest Y. Frames go where their motor position says.
+        u_ends = (sign * h[0], sign * (h[0] + (nh - 1) * h[1]))
+        v_ends = (v[0], v[0] + (nv - 1) * v[1])
+        u_min, v_min = min(u_ends), min(v_ends)
+        out_w = int(round(abs(u_ends[1] - u_ends[0]) * mm_px)) + img_w
+        out_h = int(round(abs(v_ends[1] - v_ends[0]) * mm_px)) + img_h
+        self.log_signal.emit(f"Canvas: {out_w}×{out_h}, Image: {img_w}×{img_h}, "
+                             f"Step: {abs(h[1]) * mm_px:.0f}×{abs(v[1]) * mm_px:.0f}px")
+
+        d.stitched_lock.lock()
+        setattr(d, attr, np.zeros((out_h, out_w), dtype=np.uint16))
+        d.stitched_lock.unlock()
+
+        position = 0
+        for i in range(nh):
+            if not d.scanning:
+                break
+            for j in range(nv):
+                if not d.scanning:
+                    break
+                h_pos = h[0] + i * h[1]
+                v_pos = v[0] + j * v[1]
+                position += 1
+                self.log_signal.emit(
+                    f"[{position}/{total_positions}] {h_name}={h_pos:.3f}, Y={v_pos:.3f}")
+
+                # Remember the newest frame before moving, so the capture
+                # below waits for a frame taken at the new position.
+                uid_before = d._frame_uid()
+
+                if not d.test_mode:
+                    try:
+                        subprocess.run(['caput', h_pv, str(h_pos)],
+                                       capture_output=True, timeout=5)
+                        subprocess.run(['caput', v_pv, str(v_pos)],
+                                       capture_output=True, timeout=5)
+                    except Exception as e:
+                        self.log_signal.emit(f"  ⚠ Motor error: {e}")
+
+                at_h = d._wait_for_motor(h_pv, h_pos, motor_tolerance, timeout)
+                at_v = d._wait_for_motor(v_pv, v_pos, motor_tolerance, timeout)
+                self.position_signal.emit(position, total_positions, h_pos, v_pos, 0)
+
+                if not (at_h and at_v):
+                    self.log_signal.emit("  ✗ motors did not reach target — frame not captured")
+                    self.progress_signal.emit(position, total_positions)
+                    continue
+
+                time.sleep(0.1 if d.test_mode else settle_time)
+
+                img = None
+                # The PV path already waits up to 10 s for a fresh frame.
+                max_retries = 1 if d.image_pv.text().strip() else 3
+                for retry in range(max_retries):
+                    img = d._get_image_now(position, total_positions, after_uid=uid_before)
+                    if img is not None:
+                        break
+                    if retry < max_retries - 1:
+                        self.log_signal.emit(f"  ⚠ No image yet, waiting... ({retry+1}/{max_retries})")
+                        time.sleep(0.2)
+
+                if img is not None:
+                    col = int(round((sign * h_pos - u_min) * mm_px))
+                    row = int(round((v_pos - v_min) * mm_px))
+                    self._place_image_in_canvas(img, col, row, attr)
+                    self.log_signal.emit("  ✓ Image captured and placed in mosaic")
+                else:
+                    err = d._last_capture_error
+                    self.log_signal.emit("  ✗ No image available - " + (err or "check camera stream"))
+                self.progress_signal.emit(position, total_positions)
+
+        self.log_signal.emit(f"Mosaic done: {position} position(s)")
+        return dict(h_start=u_min, y_start=v_min, pixel_size_um=pixel_size_um,
+                    img_w=img_w, img_h=img_h, out_h=out_h)
 
     def _run_mosaic_script(self):
         """Run tomoscan mosaic command directly (integrated, no external shell script)"""
@@ -1381,20 +1667,16 @@ class ScanWorker(QtCore.QThread):
             import traceback
             self.log_signal.emit(traceback.format_exc())
 
-    def _place_image_in_canvas(self, img, i, j, eff_w, eff_h, out_w, out_h):
-        """Place image in stitched canvas"""
+    def _place_image_in_canvas(self, img, start_x, start_y, attr="stitched_image"):
+        """Paste a frame into a stitched canvas at pixel (start_x, start_y)."""
         img_h, img_w = img.shape
-
-        start_x = i * eff_w
-        start_y = j * eff_h
-        end_x = min(start_x + img_w, out_w)
-        end_y = min(start_y + img_h, out_h)
-
-        sub = img[:end_y - start_y, :end_x - start_x]
-
         self.dialog.stitched_lock.lock()
         try:
-            self.dialog.stitched_image[start_y:end_y, start_x:end_x] = sub
+            canvas = getattr(self.dialog, attr)
+            out_h, out_w = canvas.shape
+            end_x = min(start_x + img_w, out_w)
+            end_y = min(start_y + img_h, out_h)
+            canvas[start_y:end_y, start_x:end_x] = img[:end_y - start_y, :end_x - start_x]
         finally:
             self.dialog.stitched_lock.unlock()
 

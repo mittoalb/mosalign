@@ -88,6 +88,9 @@ class Tile:
     width_px: int
     height_px: int
     overrides: Dict[str, str] = field(default_factory=dict)
+    # Horizontal motor seen at 90° (along the beam at 0°). None when no
+    # 90° preview was taken; the tile then only has X / Y.
+    z_mm: Optional[float] = None
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -196,17 +199,29 @@ class TileManager(QtCore.QObject):
 
     selectionChanged = QtCore.pyqtSignal(int)
     tileChanged = QtCore.pyqtSignal(int)
+    tilesListChanged = QtCore.pyqtSignal()   # tiles added / removed / replaced
 
-    def __init__(self, view_box: pg.ViewBox, dialog, logger=None):
+    def __init__(self, view_box: pg.ViewBox, dialog, logger=None,
+                 h_attr: str = "x_mm", primary: "Optional[TileManager]" = None,
+                 h_sign: int = 1):
+        """h_attr: which tile coordinate is horizontal in this view —
+        "x_mm" for the 0° mosaic, "z_mm" for the 90° mosaic. A manager with
+        a `primary` is a mirror: it shows the primary's tiles on another
+        mosaic and forwards tile creation / deletion to it.
+        h_sign: -1 when that motor moves the sample the other way on the
+        camera at this angle (X seen at 180°)."""
         super().__init__()
         self.view_box = view_box
         self.dialog = dialog
         self.logger = logger
+        self.h_attr = h_attr
+        self.primary = primary
+        self.h_sign = 1 if h_sign >= 0 else -1
 
-        self.tiles: List[Tile] = []
+        self._tiles: List[Tile] = []
         self._rois: Dict[int, pg.RectROI] = {}
         self._labels: Dict[int, pg.TextItem] = {}
-        self._next_id: int = 1
+        self._own_next_id: int = 1
         self._selected_tid: int = -1
 
         # Snapshot captured at seed_from_grid time; None when no session active
@@ -218,6 +233,65 @@ class TileManager(QtCore.QObject):
         self.out_h: Optional[int] = None
         self.sensor_w: Optional[int] = None
         self.sensor_h: Optional[int] = None
+
+    # ── shared tile list (mirror managers use the primary's) ────────────
+
+    @property
+    def tiles(self) -> List[Tile]:
+        return self.primary.tiles if self.primary is not None else self._tiles
+
+    @tiles.setter
+    def tiles(self, value: List[Tile]):
+        if self.primary is not None:
+            self.primary.tiles = value
+        else:
+            self._tiles = value
+
+    @property
+    def _next_id(self) -> int:
+        return self.primary._next_id if self.primary is not None else self._own_next_id
+
+    @_next_id.setter
+    def _next_id(self, v: int):
+        if self.primary is not None:
+            self.primary._next_id = v
+        else:
+            self._own_next_id = v
+
+    def _h(self, tile: "Tile") -> Optional[float]:
+        return getattr(tile, self.h_attr)
+
+    def set_geometry(self, *, h_start: float, y_start: float, pixel_size_um: float,
+                     img_w: int, img_h: int, out_h: int, sensor_w: int, sensor_h: int,
+                     h_attr: Optional[str] = None, h_sign: Optional[int] = None):
+        """Canvas snapshot of this view's mosaic (no tiles created).
+        h_start: h_sign × motor at the canvas's left edge."""
+        if h_attr is not None:
+            self.h_attr = h_attr
+        if h_sign is not None:
+            self.h_sign = 1 if h_sign >= 0 else -1
+        self.x_start_mm = float(h_start)
+        self.y_start_mm = float(y_start)
+        self.pixel_size_um = float(pixel_size_um)
+        self.img_w, self.img_h, self.out_h = int(img_w), int(img_h), int(out_h)
+        self.sensor_w, self.sensor_h = int(sensor_w), int(sensor_h)
+
+    def sync_tile(self, tid: int):
+        """Another view changed tile `tid`: follow it (no re-emit)."""
+        tile = self._tile_by_id(tid)
+        if tile is None:
+            return
+        if tid in self._rois:
+            self._sync_roi_from_tile(tile)
+        elif self.is_active() and self._h(tile) is not None:
+            self._make_roi(tile)
+
+    def link(self, other: "TileManager"):
+        """Keep two views of the same tiles in step (call once, both ways)."""
+        other.tileChanged.connect(self.sync_tile)
+        other.tilesListChanged.connect(self.restore_rois)
+        other.selectionChanged.connect(
+            lambda tid: self.select_tile(tid, emit=False))
 
     # ── logging passthrough ─────────────────────────────────────────────
 
@@ -238,14 +312,16 @@ class TileManager(QtCore.QObject):
         Y is inverted to match the display `np.flipud` in
         gui._refresh_stitched_preview.
         """
-        cx = (x_mm - self.x_start_mm) * 1000.0 / self.pixel_size_um
+        # x_start_mm = h_sign × this view's horizontal motor (X at 0°, Z at
+        # 90°, X again at 180° with h_sign -1) at the canvas's left edge
+        cx = (self.h_sign * x_mm - self.x_start_mm) * 1000.0 / self.pixel_size_um
         cy = (self.out_h - self.img_h
               - (y_mm - self.y_start_mm) * 1000.0 / self.pixel_size_um)
         return cx, cy
 
     def canvas_px_to_mm(self, cx: float, cy: float):
         """Inverse of `mm_to_canvas_px` on the tile's top-left."""
-        x_mm = self.x_start_mm + cx * self.pixel_size_um / 1000.0
+        x_mm = self.h_sign * (self.x_start_mm + cx * self.pixel_size_um / 1000.0)
         y_mm = (self.y_start_mm
                 + (self.out_h - self.img_h - cy)
                 * self.pixel_size_um / 1000.0)
@@ -259,7 +335,7 @@ class TileManager(QtCore.QObject):
 
     def tile_roi_pos(self, tile: "Tile"):
         """On-screen top-left of `tile`'s ROI."""
-        fx, fy = self.mm_to_canvas_px(tile.x_mm, tile.y_mm)
+        fx, fy = self.mm_to_canvas_px(self._h(tile), tile.y_mm)
         return (fx + (self.img_w - tile.width_px) / 2.0,
                 fy + (self.img_h - tile.height_px) / 2.0)
 
@@ -275,12 +351,15 @@ class TileManager(QtCore.QObject):
                        nx: int, ny: int,
                        pixel_size_um: float,
                        img_w: int, img_h: int, out_h: int,
-                       sensor_w: int, sensor_h: int):
-        """Wipe existing tiles and create one per grid cell."""
+                       sensor_w: int, sensor_h: int, z_mm: Optional[float] = None):
+        """Wipe existing tiles and create one per grid cell. `z_mm`: the Z
+        given to every tile (centre of the 90° preview), if there is one."""
         self.clear_all()
 
-        self.x_start_mm = float(x_start)
-        self.y_start_mm = float(y_start)
+        # Canvas origin = lowest motor value (a negative step scans downwards)
+        self.h_sign = 1
+        self.x_start_mm = min(float(x_start), float(x_start) + (nx - 1) * float(x_step))
+        self.y_start_mm = min(float(y_start), float(y_start) + (ny - 1) * float(y_step))
         self.pixel_size_um = float(pixel_size_um)
         self.img_w = int(img_w)
         self.img_h = int(img_h)
@@ -292,14 +371,16 @@ class TileManager(QtCore.QObject):
             for j in range(ny):
                 t = Tile(
                     id=self._next_id,
-                    x_mm=self.x_start_mm + i * float(x_step),
-                    y_mm=self.y_start_mm + j * float(y_step),
+                    x_mm=float(x_start) + i * float(x_step),
+                    y_mm=float(y_start) + j * float(y_step),
                     width_px=self.sensor_w,
                     height_px=self.sensor_h,
+                    z_mm=z_mm,
                 )
                 self._next_id += 1
                 self.tiles.append(t)
                 self._make_roi(t)
+        self.tilesListChanged.emit()
 
         self._log(f"[tiles] seeded {len(self.tiles)} tiles from {nx}×{ny} grid "
                   f"(sensor {sensor_w}×{sensor_h})")
@@ -309,6 +390,7 @@ class TileManager(QtCore.QObject):
             self._remove_roi(tid)
         self.tiles = []
         self._next_id = 1     # a new grid numbers its tiles from 1 again
+        self.tilesListChanged.emit()
 
     def add_tile_at_view_center(self):
         if not self.is_active():
@@ -319,19 +401,25 @@ class TileManager(QtCore.QObject):
         vr = self.view_box.viewRect()
         cx = vr.center().x() - self.sensor_w / 2.0
         cy = vr.center().y() - self.sensor_h / 2.0
-        x_mm, y_mm = self.roi_to_mm(cx, cy, self.sensor_w, self.sensor_h)
-        t = Tile(
-            id=self._next_id,
-            x_mm=x_mm, y_mm=y_mm,
-            width_px=self.sensor_w, height_px=self.sensor_h,
-        )
+        h_mm, y_mm = self.roi_to_mm(cx, cy, self.sensor_w, self.sensor_h)
+        # The coordinate this view does not show is taken from the last tile.
+        other = "z_mm" if self.h_attr == "x_mm" else "x_mm"
+        ref = self.tiles[-1] if self.tiles else None
+        kw = {self.h_attr: h_mm, other: getattr(ref, other) if ref is not None else None}
+        if kw["x_mm"] is None:
+            kw["x_mm"] = 0.0
+        t = Tile(id=self._next_id, y_mm=y_mm,
+                 width_px=self.sensor_w, height_px=self.sensor_h, **kw)
         self._next_id += 1
         self.tiles.append(t)
         self._make_roi(t)
-        self._log(f"[tiles] +tile #{t.id} at "
-                  f"X={x_mm:.3f} Y={y_mm:.3f}")
+        self.tilesListChanged.emit()
+        self._log(f"[tiles] +tile #{t.id} at {self._pos_text(t)}")
 
     def delete_tile(self, tid: int):
+        if self.primary is not None:
+            self.primary.delete_tile(tid)
+            return
         tile = self._tile_by_id(tid)
         if tile is None:
             return
@@ -339,6 +427,7 @@ class TileManager(QtCore.QObject):
             self.clear_selection()
         self.tiles.remove(tile)
         self._remove_roi(tid)
+        self.tilesListChanged.emit()
         self._log(f"[tiles] −tile #{tid}")
 
     def reset_size(self, tid: int):
@@ -415,10 +504,15 @@ class TileManager(QtCore.QObject):
         self.view_box.addItem(roi)
         self._rois[tile.id] = roi
 
+    @staticmethod
+    def _pos_text(tile: Tile) -> str:
+        z = f"  Z={tile.z_mm:.3f}" if tile.z_mm is not None else ""
+        return f"X={tile.x_mm:.3f}{z}  Y={tile.y_mm:.3f}"
+
     def _update_label(self, tile: Tile):
         label = self._labels.get(tile.id)
         if label is not None:
-            label.setText(f"#{tile.id}  X={tile.x_mm:.3f}  Y={tile.y_mm:.3f}")
+            label.setText(f"#{tile.id}  {self._pos_text(tile)}")
 
     def _remove_roi(self, tid: int):
         self._labels.pop(tid, None)
@@ -458,8 +552,8 @@ class TileManager(QtCore.QObject):
             return
         pos = roi.pos()
         size = roi.size()
-        tile.x_mm, tile.y_mm = self.roi_to_mm(pos.x(), pos.y(),
-                                              size.x(), size.y())
+        h_mm, tile.y_mm = self.roi_to_mm(pos.x(), pos.y(), size.x(), size.y())
+        setattr(tile, self.h_attr, h_mm)
         tile.width_px = int(round(size.x()))
         tile.height_px = int(round(size.y()))
         self._update_label(tile)
@@ -483,7 +577,7 @@ class TileManager(QtCore.QObject):
         clamped = (new_w != int(round(size.x()))
                    or new_h != int(round(size.y())))
 
-        tile.x_mm = new_x_mm
+        setattr(tile, self.h_attr, new_x_mm)
         tile.y_mm = new_y_mm
         tile.width_px = new_w
         tile.height_px = new_h
@@ -493,7 +587,7 @@ class TileManager(QtCore.QObject):
             self._sync_roi_from_tile(tile)
         self._update_label(tile)
 
-        self._log(f"[tiles] tile #{tid} → X={new_x_mm:.3f} Y={new_y_mm:.3f}  "
+        self._log(f"[tiles] tile #{tid} → {self._pos_text(tile)}  "
                   f"size {new_w}×{new_h}")
         self.tileChanged.emit(tid)
 
@@ -503,7 +597,7 @@ class TileManager(QtCore.QObject):
     def selected_tid(self) -> int:
         return self._selected_tid
 
-    def select_tile(self, tid: int):
+    def select_tile(self, tid: int, emit: bool = True):
         """Highlight tile `tid` (or -1 to clear) and emit selectionChanged."""
         if tid == self._selected_tid:
             return
@@ -518,14 +612,16 @@ class TileManager(QtCore.QObject):
             self._selected_tid = tid
         else:
             self._selected_tid = -1
-        self.selectionChanged.emit(self._selected_tid)
+        if emit:
+            self.selectionChanged.emit(self._selected_tid)
 
     def clear_selection(self):
         self.select_tile(-1)
 
     # ── setters callable from the side panel ────────────────────────────
 
-    def set_tile_position(self, tid: int, x_mm: float, y_mm: float):
+    def set_tile_position(self, tid: int, x_mm: float, y_mm: float,
+                          z_mm: Optional[float] = None):
         """Move tile `tid` to (x_mm, y_mm). Side panel calls this when the
         user edits the X/Y spinboxes; we update the Tile + sync the ROI
         without re-emitting tileChanged (the panel is the originator)."""
@@ -534,9 +630,11 @@ class TileManager(QtCore.QObject):
             return
         tile.x_mm = float(x_mm)
         tile.y_mm = float(y_mm)
+        if z_mm is not None:
+            tile.z_mm = float(z_mm)
         self._sync_roi_from_tile(tile)
-        self._log(f"[tiles] tile #{tid} → X={x_mm:.3f} Y={y_mm:.3f} "
-                  f"(from panel)")
+        self.tileChanged.emit(tid)           # the other view follows
+        self._log(f"[tiles] tile #{tid} → {self._pos_text(tile)} (from panel)")
 
     def set_tile_override(self, tid: int, pv_suffix: str,
                           value: Optional[str]):
@@ -552,7 +650,7 @@ class TileManager(QtCore.QObject):
 
     def _sync_roi_from_tile(self, tile: Tile):
         roi = self._rois.get(tile.id)
-        if roi is None:
+        if roi is None or self._h(tile) is None:
             return
         cx, cy = self.tile_roi_pos(tile)
         roi.blockSignals(True)
@@ -577,6 +675,8 @@ class TileManager(QtCore.QObject):
                 "out_h": self.out_h,
                 "sensor_w": self.sensor_w,
                 "sensor_h": self.sensor_h,
+                "h_attr": self.h_attr,
+                "h_sign": self.h_sign,
             },
             "tiles": [asdict(t) for t in self.tiles],
             "next_id": self._next_id,
@@ -594,6 +694,10 @@ class TileManager(QtCore.QObject):
         self.out_h = snap.get("out_h")
         self.sensor_w = snap.get("sensor_w")
         self.sensor_h = snap.get("sensor_h")
+        self.h_attr = snap.get("h_attr", self.h_attr)
+        self.h_sign = int(snap.get("h_sign", 1))
+        if self.primary is not None:
+            return                         # a mirror's tiles are the primary's
 
         self.tiles = []
         for d in data.get("tiles", []):
@@ -604,6 +708,7 @@ class TileManager(QtCore.QObject):
                 width_px=int(d["width_px"]),
                 height_px=int(d["height_px"]),
                 overrides=dict(d.get("overrides") or {}),
+                z_mm=(float(d["z_mm"]) if d.get("z_mm") is not None else None),
             ))
         ids = [t.id for t in self.tiles]
         self._next_id = max(data.get("next_id", 1),
@@ -617,7 +722,11 @@ class TileManager(QtCore.QObject):
         if not self.is_active():
             return
         for t in self.tiles:
-            self._make_roi(t)
+            if self._h(t) is not None:
+                self._make_roi(t)
+        if self._selected_tid in self._rois:
+            c, w = self._PEN_SELECTED
+            self._rois[self._selected_tid].setPen(pg.mkPen(c, width=w))
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -698,6 +807,16 @@ class TileSidePanel(QtWidgets.QWidget):
         self.y_spin.setKeyboardTracking(False)
         form.addRow(self.y_label, self.y_spin)
 
+        self.z_label = QtWidgets.QLabel("Motor Z (90°):")
+        self.z_spin = QtWidgets.QDoubleSpinBox()
+        self.z_spin.setRange(-1000, 1000)
+        self.z_spin.setDecimals(4)
+        self.z_spin.setSuffix(" mm")
+        self.z_spin.setKeyboardTracking(False)
+        self.z_spin.setToolTip("Horizontal motor seen at 90° (along the beam at 0°). "
+                               "Set by dragging the tile in the 90° mosaic.")
+        form.addRow(self.z_label, self.z_spin)
+
         # Use double spin with special-value at minimum = "(default)"
         self.proj_spin = QtWidgets.QSpinBox()
         self.proj_spin.setRange(0, 100000)
@@ -742,6 +861,7 @@ class TileSidePanel(QtWidgets.QWidget):
         # Wire signals
         self.x_spin.valueChanged.connect(self._on_xy_edited)
         self.y_spin.valueChanged.connect(self._on_xy_edited)
+        self.z_spin.valueChanged.connect(self._on_xy_edited)
         self.proj_spin.valueChanged.connect(self._on_proj_edited)
         self.expo_spin.valueChanged.connect(self._on_expo_edited)
 
@@ -778,8 +898,15 @@ class TileSidePanel(QtWidgets.QWidget):
         for w in (self.x_spin, self.y_spin, self.proj_spin, self.expo_spin,
                   self.reset_btn, self.del_btn, self.adv_btn):
             w.setEnabled(on)
+        if not on:
+            self.z_spin.setEnabled(False)
 
     # ── signals from TileManager ────────────────────────────────────────
+
+    def add_view(self, tm: "TileManager"):
+        """Also follow selection / edits made in another view (90° mosaic)."""
+        tm.selectionChanged.connect(self._on_selection_changed)
+        tm.tileChanged.connect(self._on_tile_changed)
 
     def _on_selection_changed(self, tid: int):
         if tid < 0:
@@ -814,6 +941,10 @@ class TileSidePanel(QtWidgets.QWidget):
                 self.y_spin.blockSignals(True)
                 self.y_spin.setValue(tile.y_mm)
                 self.y_spin.blockSignals(False)
+                self.z_spin.blockSignals(True)
+                self.z_spin.setEnabled(tile.z_mm is not None)
+                self.z_spin.setValue(tile.z_mm if tile.z_mm is not None else 0.0)
+                self.z_spin.blockSignals(False)
             if 'size' in fields:
                 self.size_label.setText(
                     f"{tile.width_px} × {tile.height_px} px")
@@ -841,9 +972,10 @@ class TileSidePanel(QtWidgets.QWidget):
     def _on_xy_edited(self, *_):
         if self._suspend_writeback or self.tm.selected_tid < 0:
             return
+        tile = self.tm._tile_by_id(self.tm.selected_tid)
+        z = self.z_spin.value() if (tile is not None and tile.z_mm is not None) else None
         self.tm.set_tile_position(self.tm.selected_tid,
-                                  self.x_spin.value(),
-                                  self.y_spin.value())
+                                  self.x_spin.value(), self.y_spin.value(), z)
 
     def _on_proj_edited(self, val: int):
         if self._suspend_writeback or self.tm.selected_tid < 0:
@@ -975,6 +1107,8 @@ class TileRunWorker(QtCore.QThread):
             self._tomo_prefix = tomo_prefix
             motor1_pv     = self.dialog.motor1_pv.text().strip()
             motor2_pv     = self.dialog.motor2_pv.text().strip()
+            motor3_pv     = (self.dialog.motor3_pv.text().strip()
+                             if hasattr(self.dialog, "motor3_pv") else "")
             tile_timeout  = self.dialog.tile_timeout.value()
             motor_tol     = self.dialog.motor_tolerance.value()
             caput_timeout = self.dialog.caput_timeout.value()
@@ -1006,7 +1140,7 @@ class TileRunWorker(QtCore.QThread):
                     self.log_signal.emit("─" * 60)
                     self.log_signal.emit(
                         f"[tile {idx}/{len(tiles)}] #{tile.id} "
-                        f"X={tile.x_mm:.3f} Y={tile.y_mm:.3f} "
+                        f"{TileManager._pos_text(tile)} "
                         f"{tile.width_px}×{tile.height_px} "
                         f"overrides={len(tile.overrides)}")
 
@@ -1026,16 +1160,22 @@ class TileRunWorker(QtCore.QThread):
                                            caput_timeout)
                         self.dialog._caput(motor2_pv, tile.y_mm,
                                            caput_timeout)
+                        use_z = bool(motor3_pv) and tile.z_mm is not None
+                        if use_z:
+                            self.log_signal.emit(f"  move {motor3_pv}→{tile.z_mm:.3f}")
+                            self.dialog._caput(motor3_pv, tile.z_mm, caput_timeout)
                         at_x = self.dialog._wait_for_motor(
                             motor1_pv, tile.x_mm, motor_tol, caput_timeout)
                         at_y = self.dialog._wait_for_motor(
                             motor2_pv, tile.y_mm, motor_tol, caput_timeout)
-                        if not (at_x and at_y):
+                        at_z = (not use_z) or self.dialog._wait_for_motor(
+                            motor3_pv, tile.z_mm, motor_tol, caput_timeout)
+                        if not (at_x and at_y and at_z):
                             # Scanning from the wrong place wastes a whole
                             # tomography; skip this tile instead.
                             self.log_signal.emit(
                                 f"  ✗ skipping tile #{tile.id}: motors did not "
-                                f"reach X={tile.x_mm:.3f} Y={tile.y_mm:.3f}")
+                                f"reach {TileManager._pos_text(tile)}")
                             self.progress_signal.emit(idx, len(tiles))
                             continue
                         time.sleep(0.1 if self.dialog.test_mode else settle)
