@@ -394,7 +394,7 @@ class TileManager(QtCore.QObject):
 
     def add_tile_at_view_center(self):
         if not self.is_active():
-            self._log("[tiles] no scan snapshot yet — run a grid scan first")
+            self._log("[tiles] no preview yet — click Preview first")
             return
         # Centre of current view in scene coords; map to a tile top-left
         # (top-left = centre − half sensor)

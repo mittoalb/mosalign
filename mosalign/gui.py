@@ -185,7 +185,9 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.toggle_left_btn.toggled.connect(self._toggle_left_panel)
         tile_btns.addWidget(self.toggle_left_btn)
 
-        self.start_btn = QtWidgets.QPushButton("Start Scan")
+        self.start_btn = QtWidgets.QPushButton("Preview")
+        self.start_btn.setToolTip("Take the preview mosaic (and the second-angle one, "
+                                  "if ticked on the Scan tab). Tiles are placed on it.")
         self.start_btn.setAutoDefault(False)
         self.start_btn.setDefault(False)
         self.start_btn.clicked.connect(self._start_scan)
@@ -225,7 +227,8 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.add_tile_btn.clicked.connect(self._add_tile_at_center)
         tile_btns.addWidget(self.add_tile_btn)
 
-        self.run_tiles_btn = QtWidgets.QPushButton("Run Tiles")
+        self.run_tiles_btn = QtWidgets.QPushButton("Run Scans")
+        self.run_tiles_btn.setToolTip("Run a TomoScan scan at each tile")
         self.run_tiles_btn.setAutoDefault(False)
         self.run_tiles_btn.setDefault(False)
         self.run_tiles_btn.setEnabled(False)
@@ -1208,12 +1211,12 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.scan_thread.finished_signal.connect(self._scan_finished)
         self.scan_thread.start()
 
-        self._log("=== Scan started ===")
+        self._log("=== Preview started ===")
 
     def _stop_scan(self):
         """Stop the running scan"""
         self.scanning = False
-        self._log("⚠ Stopping scan...")
+        self._log("⚠ Stopping...")
         self.stop_btn.setEnabled(False)
         # If a tile run is in flight, kill the active caput so its per-tile
         # and outer try/finally restoration blocks can run.
@@ -1230,10 +1233,10 @@ class MotorScanDialog(QtWidgets.QDialog):
     def _run_tiles(self):
         """Launch TileRunWorker to step through each tile + StartScan."""
         if self.tile_manager is None or not self.tile_manager.tiles:
-            self._log("⚠ No tiles to run — finish a grid scan first.")
+            self._log("⚠ No tiles — take a Preview first.")
             return
         if self.tile_run_worker is not None and self.tile_run_worker.isRunning():
-            self._log("⚠ Tile run already in progress.")
+            self._log("⚠ Scans already running.")
             return
         if not self._motors_configured():
             return
@@ -1301,7 +1304,7 @@ class MotorScanDialog(QtWidgets.QDialog):
 
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self._log("=== Scan finished ===")
+        self._log("=== Preview finished ===")
 
         # Seed the interactive-tiles overlay from the just-finished grid.
         # If the worker bailed before stashing geometry (e.g. tomoscan-mosaic
