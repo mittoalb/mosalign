@@ -32,6 +32,73 @@ except ImportError:
     from tiles import TileManager, TileRunWorker, TileSidePanel
 
 
+class LiveCameraThread(QtCore.QThread):
+    """Reads the Image PV in the background: reports the connection status
+    (always) and, when `want_frames` is set, sends display-size frames for
+    the Live view. Its own pvaccess channel, so it never blocks the GUI or
+    the scan workers."""
+    status = QtCore.pyqtSignal(bool, str)        # connected, text
+    frame = QtCore.pyqtSignal(object)            # 2-D numpy array (display size)
+
+    def __init__(self, pv: str, parent=None):
+        super().__init__(parent)
+        self.pv = pv
+        self.want_frames = False
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            import pvaccess as pva
+        except ImportError:
+            self.status.emit(False, "Camera: pvaccess not installed")
+            return
+        ch, last_uid, rate = None, None, None
+        uids = []                                  # (time, uid) for the frame rate
+        next_status = 0.0
+        while not self._stop:
+            try:
+                if ch is None:
+                    ch = pva.Channel(self.pv)
+                uid = int(ch.get("field(uniqueId)")["uniqueId"])
+                now = time.monotonic()
+                uids.append((now, uid))
+                uids = [(t, u) for t, u in uids if now - t < 5.0]
+                span = uids[-1][0] - uids[0][0]
+                rate = (uids[-1][1] - uids[0][1]) / span if span >= 1.0 else None
+                if self.want_frames and uid != last_uid:
+                    st = ch.get("")
+                    img = MotorScanDialog._ntnda_to_array(st)
+                    h, w = img.shape
+                    step = max(1, int(np.ceil(max(h, w) / 1200)))
+                    self.frame.emit(np.ascontiguousarray(img[::step, ::step]))
+                    self._shape = (w, h)
+                    last_uid = uid
+                if now >= next_status:
+                    shape = getattr(self, "_shape", None)
+                    size = f", {shape[0]}×{shape[1]}" if shape else ""
+                    if rate is None:
+                        fps = ""                    # not measured yet
+                    elif rate == 0:
+                        fps = ", no new frames (camera not acquiring?)"
+                    else:
+                        fps = f", {rate:.1f} fps"
+                    self.status.emit(True, f"Camera: connected{size}{fps}")
+                    next_status = now + 2.0
+            except Exception as e:
+                ch = None
+                self.status.emit(False, f"Camera: no connection to {self.pv} "
+                                        f"({type(e).__name__}: {str(e)[:80]})")
+                for _ in range(20):                # retry every 2 s
+                    if self._stop:
+                        return
+                    time.sleep(0.1)
+                continue
+            time.sleep(0.25 if self.want_frames else 0.5)
+
+
 class MotorScanDialog(QtWidgets.QDialog):
     """Dialog for configuring and running 2D motor scans"""
 
@@ -69,10 +136,16 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.setWindowTitle("Mosalign")
         self.resize(1200, 800)
 
+        self.live_thread: Optional[LiveCameraThread] = None
+        self._live_levels = None
+
         self._build_ui()
         self._load_config()
 
         self._on_preview_toggled(self.enable_preview.isChecked())
+        self.image_pv.editingFinished.connect(self._restart_camera)
+        self._restart_camera()
+        self._set_view_mode(live=True)
 
     def _build_ui(self):
         main_layout = QtWidgets.QHBoxLayout(self)
@@ -142,6 +215,17 @@ class MotorScanDialog(QtWidgets.QDialog):
         self.run_tiles_btn.clicked.connect(self._run_tiles)
         tile_btns.addWidget(self.run_tiles_btn)
 
+        self.view_live = QtWidgets.QRadioButton("Live")
+        self.view_live.setToolTip("Current camera image (Image PV) — to find and focus the sample")
+        self.view_mosaic = QtWidgets.QRadioButton("Mosaic")
+        self.view_mosaic.setToolTip("Stitched grid-scan mosaic with the tiles")
+        self._view_group = QtWidgets.QButtonGroup(self)
+        self._view_group.addButton(self.view_live)
+        self._view_group.addButton(self.view_mosaic)
+        self.view_live.toggled.connect(lambda on: self._set_view_mode(live=on))
+        tile_btns.addWidget(self.view_live)
+        tile_btns.addWidget(self.view_mosaic)
+
         self.progress = QtWidgets.QProgressBar()
         self.progress.setMaximumWidth(220)
         tile_btns.addWidget(self.progress)
@@ -204,6 +288,70 @@ class MotorScanDialog(QtWidgets.QDialog):
     def _toggle_tile_panel(self, shown: bool):
         self.tile_side_panel.setVisible(shown)
         self.toggle_right_btn.setText("Tiles ▶" if shown else "◀ Tiles")
+
+    # ── live camera / status ────────────────────────────────────────────
+
+    def _restart_camera(self):
+        """(Re)start the background camera reader for the current Image PV."""
+        if self.live_thread is not None:
+            self.live_thread.stop()
+            self.live_thread.wait(3000)
+            self.live_thread = None
+        pv = self.image_pv.text().strip()
+        if not pv:
+            self.connection_status.setText("Camera: no Image PV set")
+            return
+        self.connection_status.setText(f"Camera: connecting to {pv}…")
+        t = LiveCameraThread(pv, self)
+        t.status.connect(self._on_camera_status)
+        t.frame.connect(self._on_live_frame)
+        t.want_frames = self._live_mode()
+        t.start()
+        self.live_thread = t
+
+    def _on_camera_status(self, ok: bool, text: str):
+        if self.test_mode:
+            return                                  # test mode shows its own status
+        self.connection_status.setText(text)
+        self.connection_status.setStyleSheet("" if ok else "color: #d62728;")
+
+    def _live_mode(self) -> bool:
+        return hasattr(self, "view_live") and self.view_live.isChecked()
+
+    def _set_view_mode(self, live: bool):
+        """Live: camera frames, tiles hidden. Mosaic: stitched preview + tiles."""
+        for btn, on in ((self.view_live, live), (self.view_mosaic, not live)):
+            btn.blockSignals(True)
+            btn.setChecked(on)
+            btn.blockSignals(False)
+        if self.live_thread is not None:
+            self.live_thread.want_frames = live
+        if self.tile_manager is not None:
+            for roi in self.tile_manager._rois.values():
+                roi.setVisible(not live)
+            for lbl in getattr(self.tile_manager, "_labels", {}).values():
+                lbl.setVisible(not live)
+        self._live_levels = None
+        self._live_autorange = True
+        if live:
+            self.image_view.clear()
+        else:
+            self._preview_initialized_view = False
+            if hasattr(self, "_preview_initialized"):
+                delattr(self, "_preview_initialized")
+            self._refresh_stitched_preview()
+
+    def _on_live_frame(self, img):
+        if not self._live_mode():
+            return
+        disp = np.flipud(img)                       # same orientation as in the mosaic
+        if self.auto_contrast.isChecked() or self._live_levels is None:
+            lo, hi = np.percentile(disp, (0.5, 99.5))
+            self._live_levels = (float(lo), float(hi if hi > lo else lo + 1))
+        self.image_view.setImage(disp, levels=self._live_levels)
+        if getattr(self, "_live_autorange", False):
+            self.view_box.autoRange()
+            self._live_autorange = False
 
     # ── Tab builders ────────────────────────────────────────────────────
 
@@ -501,7 +649,7 @@ class MotorScanDialog(QtWidgets.QDialog):
             self.connection_status.setText("Test Mode: Mock camera enabled")
         else:
             self._log("Test Mode DISABLED - using real PVs and tomoscan")
-            self.connection_status.setText("Status: Not connected")
+            self.connection_status.setText("Camera: checking…")
 
     def _on_preview_toggled(self, checked: bool):
         """Handle changes to the 'Enable Live Preview' checkbox."""
@@ -581,7 +729,7 @@ class MotorScanDialog(QtWidgets.QDialog):
 
     def _refresh_stitched_preview(self):
         """Refresh the stitched mosaic display"""
-        if not self.enable_preview.isChecked():
+        if not self.enable_preview.isChecked() or self._live_mode():
             return
 
         self.stitched_lock.lock()
@@ -814,6 +962,7 @@ class MotorScanDialog(QtWidgets.QDialog):
         """Start the 2D motor scan"""
         if not self._motors_configured():
             return
+        self._set_view_mode(live=False)      # show the mosaic being built
         self.scanning = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -979,6 +1128,10 @@ class MotorScanDialog(QtWidgets.QDialog):
 
         if self.preview_timer.isActive():
             self.preview_timer.stop()
+
+        if self.live_thread is not None:
+            self.live_thread.stop()
+            self.live_thread.wait(3000)
 
         if self.scan_thread and self.scan_thread.isRunning():
             self.scan_thread.quit()
